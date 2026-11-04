@@ -1,0 +1,31 @@
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Audio datasets - do not upload raw recordings
+data/raw/
+data/processed/
+data/segments/
+
+# Generated outputs
+outputs/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
