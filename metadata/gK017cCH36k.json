@@ -1,0 +1,29 @@
+{
+  "video_id": "gK017cCH36k",
+  "source_url": "https://www.youtube.com/watch?v=gK017cCH36k",
+  "title": "DSP - Elective 2 || Lecture 1",
+  "channel": "EECE 27",
+  "channel_id": "UCo-QktcCtYiHqY4qmRZB9mw",
+  "upload_date": "20260926",
+  "duration_seconds": 5741,
+  "description": null,
+  "language_reported": "ar",
+  "license_reported": "NA",
+  "notes": "Recorded lecture by Dr. Mohsen Rashwan. Preserved for academic speech corpus research with instructor permission.",
+  "ingestion_info": {
+    "tool": "yt-dlp",
+    "tool_version": "2026.10.26",
+    "ingested_at_utc": "2026-11-13T20:24:45.266283+00:00",
+    "raw_file": "data\\raw\\gK017cCH36k.m4a",
+    "raw_size_bytes": 92843626
+  },
+  "audio_properties": {
+    "processed_file": "data\\processed\\gK017cCH36k.wav",
+    "sample_rate": 16000,
+    "channels": 1,
+    "subtype": "PCM_16",
+    "format": "WAV",
+    "duration_seconds": 5740.81,
+    "total_frames": 91852939
+  }
+}

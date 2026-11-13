@@ -29,3 +29,6 @@ outputs/
 *.tmp
 *.log
 .DS_Store
+
+# Local cache
+.cache/

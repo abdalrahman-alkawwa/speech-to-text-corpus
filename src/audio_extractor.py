@@ -6,22 +6,57 @@ Extracts 16 kHz, mono, 16-bit PCM WAV audio from source media using FFmpeg
 and validates properties programmatically with SoundFile.
 """
 
-import subprocess
+import sys
+import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Dict, Any, Union
 import soundfile as sf
 
 
 def check_ffmpeg_available() -> str:
-    """Verifies that ffmpeg executable is reachable in PATH."""
+    """
+    Verifies that ffmpeg executable is reachable in PATH.
+    If not immediately in PATH (common in Windows terminals before full IDE restart),
+    checks the Windows Registry User Environment and common WinGet paths,
+    adding the directory to os.environ["PATH"] at runtime.
+    """
     ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        raise RuntimeError(
-            "FFmpeg executable not found in PATH. "
-            "Please ensure FFmpeg is installed and added to your environment Path."
-        )
-    return ffmpeg_path
+    if ffmpeg_path:
+        return ffmpeg_path
+
+    # Resilient fallback on Windows
+    if sys.platform == "win32":
+        # 1. Check User PATH from Windows Registry
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+                user_path, _ = winreg.QueryValueEx(key, "Path")
+                for item in user_path.split(";"):
+                    item = item.strip()
+                    if item and Path(item).is_dir():
+                        candidate = Path(item) / "ffmpeg.exe"
+                        if candidate.exists():
+                            os.environ["PATH"] = str(item) + os.pathsep + os.environ.get("PATH", "")
+                            return str(candidate)
+        except Exception:
+            pass
+
+        # 2. Check WinGet Packages directory directly
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            winget_pkgs = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+            if winget_pkgs.exists():
+                for candidate in winget_pkgs.glob("**/ffmpeg.exe"):
+                    bin_dir = str(candidate.parent)
+                    os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+                    return str(candidate)
+
+    raise RuntimeError(
+        "FFmpeg executable not found in PATH or standard installation locations. "
+        "Please ensure FFmpeg is installed and added to your environment Path."
+    )
 
 
 def extract_audio(
