@@ -1,8 +1,27 @@
+# Audio processing
 numpy
+scipy
+soundfile
+librosa
+pydub
+
+# Data handling and visualization
 pandas
 matplotlib
 tqdm
-soundfile
-librosa
-scipy
-pydub
+
+# Video/audio acquisition
+yt-dlp
+
+# Speech recognition
+faster-whisper
+transformers
+
+# Speech activity detection
+silero-vad
+
+# Transcript evaluation
+jiwer
+
+# Annotation interface
+streamlit
