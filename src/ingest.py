@@ -19,10 +19,10 @@ This module provides the automated ingestion pipeline:
   7. Writes a permanent, reproducible metadata record to metadata/<video_id>.json.
 """
 
-# sys: System-specific parameters and module search path (sys.path)
+
 import sys
 
-# Path: Clean, cross-platform filesystem path object
+
 from pathlib import Path
 
 # --- Python Path Configuration ---
@@ -37,6 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # json: Standard library for reading and writing structured JSON metadata files
 import json
+import re
 
 # datetime, timezone: For generating standard ISO 8601 UTC timestamps of when downloads occurred
 from datetime import datetime, timezone
@@ -67,7 +68,7 @@ def get_ytdlp_version() -> str:
     Returns the currently installed yt-dlp version as a string.
     Recording the tool version in metadata is required for scientific reproducibility.
     """
-    return getattr(yt_dlp.version, "__version__", "unknown")
+    return yt_dlp.version.__version__
 
 
 def fetch_video_metadata(url: str) -> Dict[str, Any]:
@@ -86,11 +87,11 @@ def fetch_video_metadata(url: str) -> Dict[str, Any]:
     # Options passed to yt-dlp:
     # - quiet: suppress command-line noise
     # - no_warnings: suppress non-critical warnings
-    # - skip_download: strictly fetch metadata without downloading audio/video streams
+    
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
+      
     }
 
     # Initialize yt-dlp with our options
@@ -101,32 +102,44 @@ def fetch_video_metadata(url: str) -> Dict[str, Any]:
         return ydl.sanitize_info(info)
 
 
+def sanitize_title(title: str, max_length: int = 50) -> str:
+    """
+    Sanitizes a video title so it can be safely used in Windows/Linux file paths.
+    Replaces illegal characters (\\ / : * ? " < > |) and spaces with clean underscores.
+    Preserves Arabic and alphanumeric text, truncating to max_length to avoid Windows PATH limits.
+    """
+    if not title:
+        return "audio"
+    # Replace characters not allowed in Windows filenames with an underscore
+    cleaned = re.sub(r'[\\/*?:"<>|#%&{}\\<>*?/$!\'":@+`|=]', "_", title)
+    # Collapse multiple consecutive underscores or whitespace into a single underscore
+    cleaned = re.sub(r"[\s_]+", "_", cleaned).strip("._ ")
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length].rstrip("._ ")
+    return cleaned or "audio"
+
+
 def find_existing_raw_file(video_id: str) -> Optional[Path]:
     """
     Checks if a raw media file matching this video_id already exists in data/raw/.
-
-    Why this function is important:
-    -------------------------------
-    YouTube provides audio in multiple container formats (.m4a, .webm, .mp4).
-    If the user previously downloaded the audio (e.g. gK017cCH36k.m4a), we must
-    detect it under any valid audio/video extension rather than blindly downloading again.
-    Incomplete partial downloads (.part, .ytdl) are excluded.
-
-    Parameters:
-    -----------
-    video_id : str
-        Unique video identifier (e.g. 'gK017cCH36k').
-
-    Returns:
-    --------
-    Path or None: The existing file Path if found, otherwise None.
+    Uses glob matching '*{video_id}*' so it supports both pure ID names
+    (e.g. gK017cCH36k.m4a) and title+ID names (e.g. DSP_Lecture_1_gK017cCH36k.m4a).
     """
     valid_exts = {".m4a", ".webm", ".mp4", ".mkv", ".wav", ".opus", ".mp3"}
 
-    # Search for all files matching '<video_id>.*' in data/raw/
-    for candidate in RAW_DIR.glob(f"{video_id}.*"):
-        # Check that extension is a valid media format and file is non-empty (>1000 bytes)
+    # Search for any file containing the video_id in data/raw/
+    for candidate in RAW_DIR.glob(f"*{video_id}*"):
         if candidate.suffix.lower() in valid_exts and candidate.stat().st_size > 1000:
+            return candidate
+    return None
+
+
+def find_existing_processed_wav(video_id: str) -> Optional[Path]:
+    """
+    Checks if a processed 16 kHz WAV file matching this video_id already exists in data/processed/.
+    """
+    for candidate in PROCESSED_DIR.glob(f"*{video_id}*.wav"):
+        if candidate.stat().st_size > 1000:
             return candidate
     return None
 
@@ -165,10 +178,16 @@ def ingest_video(
     print(f"\n[ingest] Fetching metadata for: {url}")
     info = fetch_video_metadata(url)
     video_id = info.get("id")
+    title = info.get("title", "")
 
     # Safety check: every online video must have a unique identifier
     if not video_id:
         raise ValueError(f"Could not determine video ID from URL: {url}")
+
+    # Build human-readable file stem: <Sanitized_Title>_<video_id>
+    # e.g., DSP_Elective_2_Lecture_1_gK017cCH36k
+    safe_title = sanitize_title(title)
+    file_stem = f"{safe_title}_{video_id}"
 
     # Check if we already have the raw recording saved on disk
     raw_path = find_existing_raw_file(video_id)
@@ -178,11 +197,11 @@ def ingest_video(
         print(f"[ingest] Found existing raw media on disk: {raw_path.name} ({raw_path.stat().st_size / (1024*1024):.1f} MB)")
     else:
         # File is not on disk: download best available audio stream
-        print(f"[ingest] No local file found. Downloading raw audio for video ID: {video_id}")
+        print(f"[ingest] No local file found. Downloading raw audio: {file_stem}")
         ydl_download_opts = {
-            "format": "bestaudio/best",                           # Select highest quality audio stream
-            "outtmpl": str(RAW_DIR / f"{video_id}.%(ext)s"),      # Save as data/raw/<video_id>.<extension>
-            "quiet": False,                                       # Display download progress
+            "format": "bestaudio/best",
+            "outtmpl": str(RAW_DIR / f"{file_stem}.%(ext)s"),
+            "quiet": False,
             "no_warnings": True,
         }
         with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
@@ -194,8 +213,9 @@ def ingest_video(
             raise FileNotFoundError(f"Failed to find downloaded file for video ID: {video_id}")
 
     # --- Stage 2 Execution: Audio Extraction ---
-    # Define standardized target path: data/processed/<video_id>.wav
-    processed_wav_path = PROCESSED_DIR / f"{video_id}.wav"
+    # Check if a 16 kHz WAV already exists for this video (matches either old ID or new title+ID)
+    existing_wav = find_existing_processed_wav(video_id)
+    processed_wav_path = existing_wav if existing_wav else (PROCESSED_DIR / f"{file_stem}.wav")
 
     # Extract 16 kHz mono 16-bit PCM WAV using our audio_extractor module
     extracted_wav = extract_audio(
