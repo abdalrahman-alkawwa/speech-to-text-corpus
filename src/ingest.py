@@ -38,8 +38,8 @@ if str(PROJECT_ROOT) not in sys.path:
 # json: Standard library for reading and writing structured JSON metadata files
 import json
 import re
-
-# datetime, timezone: For generating standard ISO 8601 UTC timestamps of when downloads occurred
+import hashlib
+import shutil
 from datetime import datetime, timezone
 
 # Typing hints for clarity and IDE auto-completion
@@ -203,6 +203,15 @@ def ingest_video(
             "outtmpl": str(RAW_DIR / f"{file_stem}.%(ext)s"),
             "quiet": False,
             "no_warnings": True,
+            "continuedl": True,              # Resume interrupted downloads (.part files)
+            "retries": 10,                   # Retry on connection reset (error 10054)
+            "fragment_retries": 10,
+            "socket_timeout": 30,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web"]
+                }
+            }
         }
         with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
             ydl.download([url])
@@ -270,6 +279,93 @@ def ingest_video(
         json.dump(metadata_record, f, indent=2, ensure_ascii=False)
 
     print(f"[ingest] Metadata successfully recorded to: {metadata_json_path.name}")
+    return metadata_record
+
+
+def ingest_local_file(
+    file_path: Path,
+    title: Optional[str] = None,
+    notes: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Ingests an audio or video file uploaded or stored locally on the machine.
+    Copies it to data/raw/, transcodes to 16 kHz mono PCM_16 WAV in data/processed/,
+    and writes metadata/<file_id>.json.
+    """
+    file_path = Path(file_path).resolve()
+    if not file_path.exists():
+        raise FileNotFoundError(f"Local file not found: {file_path}")
+
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Generate a deterministic unique ID from the file content (first 1 MB)
+    hasher = hashlib.md5()
+    with open(file_path, "rb") as f:
+        hasher.update(f.read(1024 * 1024))
+    file_id = f"local_{hasher.hexdigest()[:8]}"
+
+    # Determine title
+    item_title = title or file_path.stem
+    safe_title = sanitize_title(item_title)
+    file_stem = f"{safe_title}_{file_id}"
+
+    # Target path in data/raw/
+    raw_dest = RAW_DIR / f"{file_stem}{file_path.suffix.lower()}"
+    if file_path != raw_dest:
+        shutil.copy2(file_path, raw_dest)
+
+    # Stage 2: Extract audio to 16 kHz mono PCM_16 WAV
+    processed_wav = PROCESSED_DIR / f"{file_stem}.wav"
+    extracted_wav = extract_audio(
+        input_path=raw_dest,
+        output_path=processed_wav,
+        sample_rate=16000,
+        channels=1,
+        overwrite=False
+    )
+
+    # Validate audio
+    audio_val = validate_audio(extracted_wav)
+    print(f"[ingest] Local audio validated: {audio_val['duration_seconds']}s, 16kHz, mono, PCM_16")
+
+    # Metadata record
+    metadata_record = {
+        "video_id": file_id,
+        "source_url": "local_upload",
+        "title": item_title,
+        "channel": "Local User Upload",
+        "channel_id": "local",
+        "upload_date": datetime.now(timezone.utc).strftime("%Y%m%d"),
+        "duration_seconds": int(audio_val["duration_seconds"]),
+        "description": f"Locally uploaded file: {file_path.name}",
+        "language_reported": "ar",
+        "license_reported": "User-Provided",
+        "notes": notes or "Locally uploaded audio/video for speech corpus.",
+        "ingestion_info": {
+            "tool": "local_file_importer",
+            "tool_version": "1.0",
+            "ingested_at_utc": datetime.now(timezone.utc).isoformat(),
+            "raw_file": str(raw_dest.relative_to(PROJECT_ROOT)),
+            "raw_size_bytes": raw_dest.stat().st_size,
+        },
+        "audio_properties": {
+            "processed_file": str(extracted_wav.relative_to(PROJECT_ROOT)),
+            "sample_rate": audio_val["samplerate"],
+            "channels": audio_val["channels"],
+            "subtype": audio_val["subtype"],
+            "format": audio_val["format"],
+            "duration_seconds": audio_val["duration_seconds"],
+            "total_frames": audio_val["frames"]
+        }
+    }
+
+    metadata_path = METADATA_DIR / f"{file_id}.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata_record, f, indent=2, ensure_ascii=False)
+
+    print(f"[ingest] Local metadata recorded to: {metadata_path.name}")
     return metadata_record
 
 
