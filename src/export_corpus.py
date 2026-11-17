@@ -41,7 +41,7 @@ def export_corpus_manifests(
 
     segments = get_all_segments()
     if not segments:
-        print("[export] No segments found in database to export!")
+        print("[export] No segments found in transcript files to export!")
         return {}
 
     # Deterministic split shuffling

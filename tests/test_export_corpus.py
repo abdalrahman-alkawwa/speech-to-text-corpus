@@ -12,8 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import tempfile
 import json
-import src.database
-from src.database import upsert_segment
+import src.transcript_store as transcript_store
 from src.export_corpus import export_corpus_manifests
 
 
@@ -24,34 +23,35 @@ def test_export_manifests():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
-        test_db = tmp_path / "test_corpus.db"
+        test_transcripts = tmp_path / "transcripts"
         test_out = tmp_path / "metadata"
-
-        # Populate test segments into test DB
-        print("[TEST 1] Populating test database with 10 segments...")
-        for i in range(1, 11):
-            upsert_segment({
-                "segment_id": f"vid_test_seg_{i:06d}",
-                "video_id": "vid_test",
-                "audio_path": f"data/segments/vid_test_seg_{i:06d}.wav",
-                "start_sec": (i - 1) * 10.0,
-                "end_sec": i * 10.0,
-                "duration_sec": 10.0,
-                "snr_wada_db": 25.0 + i,
-                "transcript_a": f"نص تجريبي للقطعة رقم {i}",
-                "transcript_b": f"نص تجريبي للقطعة رقم {i}",
-                "wer": 0.05 if i % 2 == 0 else 0.25,
-                "triage": "accepted" if i % 2 == 0 else "review_needed",
-                "status": "verified" if i <= 5 else "unreviewed",
-            }, db_path=test_db)
-        print("  -> Populated 10 segments\n")
-
-        # Mock the default DB path for testing export
-        import src.export_corpus as exp
-        orig_get_all = exp.get_all_segments
-        exp.get_all_segments = lambda: [dict(r) for r in src.database.get_all_segments(db_path=test_db)]
+        original_transcripts_dir = transcript_store.TRANSCRIPTS_DIR
+        transcript_store.TRANSCRIPTS_DIR = test_transcripts
 
         try:
+            # Populate the JSON transcript store with 10 segments.
+            print("[TEST 1] Populating JSON transcript store with 10 segments...")
+            transcript_store.save_transcripts("vid_test", [
+                {
+                    "segment_id": f"vid_test_seg_{i:06d}",
+                    "video_id": "vid_test",
+                    "audio_path": f"data/segments/vid_test_seg_{i:06d}.wav",
+                    "start_sec": (i - 1) * 10.0,
+                    "end_sec": i * 10.0,
+                    "duration_sec": 10.0,
+                    "snr_wada_db": 25.0 + i,
+                    "boundary_check": "auto_verified",
+                    "transcript_a": f"نص تجريبي للقطعة رقم {i}",
+                    "transcript_b": f"نص تجريبي للقطعة رقم {i}",
+                    "ground_truth": f"نص تجريبي للقطعة رقم {i}",
+                    "wer": 0.05 if i % 2 == 0 else 0.25,
+                    "triage": "accepted" if i % 2 == 0 else "review_needed",
+                    "status": "verified" if i <= 5 else "unreviewed",
+                }
+                for i in range(1, 11)
+            ])
+            print("  -> Populated 10 segments\n")
+
             print("[TEST 2] Running export_corpus_manifests()...")
             res = export_corpus_manifests(output_dir=test_out)
 
@@ -69,7 +69,7 @@ def test_export_manifests():
             print("  -> PASSED\n")
 
         finally:
-            exp.get_all_segments = orig_get_all
+            transcript_store.TRANSCRIPTS_DIR = original_transcripts_dir
 
     print("==============================================")
     print(" ALL EXPORT MANIFESTS TESTS PASSED!           ")

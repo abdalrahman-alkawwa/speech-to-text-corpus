@@ -9,11 +9,11 @@
   "description": null,
   "language_reported": "ar",
   "license_reported": "NA",
-  "notes": "Recorded lecture by Dr. Mohsen Rashwan. Preserved for academic speech corpus research with instructor permission.",
+  "notes": "Recorded lecture by Dr. Mohsen Rashwan. Preserved for academic speech corpus research.",
   "ingestion_info": {
     "tool": "yt-dlp",
     "tool_version": "2026.10.26",
-    "ingested_at_utc": "2026-11-13T20:24:45.266283+00:00",
+    "ingested_at_utc": "2026-11-17T14:18:04.277642+00:00",
     "raw_file": "data\\raw\\gK017cCH36k.m4a",
     "raw_size_bytes": 92843626
   },

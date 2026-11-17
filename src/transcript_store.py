@@ -3,7 +3,7 @@ src/transcript_store.py
 =======================
 JSON-Based Transcript Storage & Audit Trail
 
-Replaces the database with transparent, human-readable JSON files stored in:
+Stores transcripts in transparent, human-readable JSON files located in:
   data/transcripts/<video_id>_transcripts.json
 
 Each JSON file contains a list of segment objects with transcripts, metrics,

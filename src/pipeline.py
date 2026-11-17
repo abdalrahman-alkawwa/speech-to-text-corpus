@@ -1,7 +1,7 @@
 """
 src/pipeline.py
 ===============
-End-to-End Ingestion, Extraction, Classification, Segmentation, SNR, and DB Ingestion
+End-to-End Ingestion, Extraction, Classification, Segmentation, and Transcript Storage
 
 Covers Stages 1 through 10:
   Stage 1: Ingestion & Metadata (src.ingest)
@@ -11,7 +11,7 @@ Covers Stages 1 through 10:
   Stage 5: Speech Segmentation into 8–12s Clips (src.segmenter)
   Stage 6: SNR Estimation (src.snr_estimator)
   Stage 7-9: Dual ASR, Normalization, & Triage (optional via run_asr=True)
-  Stage 10: SQLite Corpus Persistence (src.database)
+  Stage 10: JSON Transcript Persistence (src.transcript_store)
 """
 
 import sys

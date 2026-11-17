@@ -21,8 +21,6 @@ __pycache__/
 data/raw/
 data/processed/
 data/segments/
-*.db
-*.sqlite3
 
 #Uploaded files metadata
 metadata/
