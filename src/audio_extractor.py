@@ -42,23 +42,7 @@ import soundfile as sf
 
 
 def check_ffmpeg_available() -> str:
-    """
-    Verifies that the FFmpeg executable is accessible on the system.
-
-    Why this function is necessary:
-    -------------------------------
-    FFmpeg is a system-level binary, not a Python package. When running inside
-    IDEs (like VS Code) on Windows, environment variables (like PATH) are sometimes
-    inherited from a parent process that started before FFmpeg was installed.
-    
-    If shutil.which("ffmpeg") fails to find FFmpeg in the active terminal PATH,
-    this function performs resilient fallbacks:
-      1. Checks the Windows Registry for the current user's PATH variable.
-      2. Directly scans the standard Windows WinGet package installation directory.
-      
-    If found via a fallback, it dynamically adds the directory to os.environ["PATH"]
-    so that subsequent subprocess calls succeed without restarting the IDE.
-    """
+   
     # 1. Standard check: look for 'ffmpeg' in the current process's PATH
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
@@ -78,7 +62,7 @@ def check_ffmpeg_available() -> str:
                 
                 # Split the PATH string into individual folder directories (separated by ';')
                 for item in user_path.split(";"):
-                    item = item.strip()
+                    item = os.path.expandvars(item.strip())
                     # If this directory exists and contains ffmpeg.exe, use it
                     if item and Path(item).is_dir():
                         candidate = Path(item) / "ffmpeg.exe"
@@ -110,6 +94,97 @@ def check_ffmpeg_available() -> str:
     )
 
 
+def _prepare_audio_paths(
+    input_path: str|Path,
+    output_path: str|Path
+) -> tuple[Path, Path]:
+    """
+    Convert paths to absolute paths and validate them.
+    """
+
+    input_file = Path(input_path).resolve()
+    output_file = Path(output_path).resolve()
+
+    # The source media file must exist.
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Input media file not found: {input_file}"
+        )
+
+    # Never allow the output to overwrite the source.
+    if input_file == output_file:
+        raise ValueError(
+            "Input and output paths cannot be the same."
+        )
+
+    # Ensure the destination directory exists.
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    return input_file, output_file
+
+
+
+
+def _run_ffmpeg(
+    cmd: list[str],
+    temporary_file: Path,
+    input_file: Path,
+    output_file: Path
+) -> None:
+    """
+    Execute FFmpeg and handle extraction errors.
+
+    If extraction fails, remove the temporary file so that
+    an incomplete WAV cannot accidentally be reused.
+    """
+
+    print(
+        f"[audio_extractor] Extracting: "
+        f"{input_file.name} -> {output_file.name}"
+    )
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace"
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg extraction failed with return code "
+                f"{result.returncode}:\n{result.stderr}"
+            )
+
+    except Exception:
+        # Clean up any incomplete temporary output.
+        temporary_file.unlink(missing_ok=True)
+        raise
+
+
+def _finalize_audio(
+    temporary_file: Path,
+    output_file: Path
+) -> Path:
+    """
+    Move the completed temporary WAV to its final destination.
+
+    os.replace() ensures that the final output filename is only
+    updated after FFmpeg has successfully completed extraction.
+    """
+
+    try:
+        os.replace(temporary_file, output_file)
+    except Exception:
+        temporary_file.unlink(missing_ok=True)
+        raise
+
+    return output_file
+
+
 def extract_audio(
     input_path: Union[str, Path],
     output_path: Union[str, Path],
@@ -118,75 +193,69 @@ def extract_audio(
     overwrite: bool = False
 ) -> Path:
     """
-    Extracts and standardizes audio from a media container into a 16-bit PCM WAV file.
+    Extract and standardize audio into a 16-bit PCM WAV file.
 
-    Parameters:
-    -----------
-    input_path : str or Path
-        Path to the source media file (e.g. .mp4, .m4a, .webm, .mkv).
-    output_path : str or Path
-        Target path for the extracted .wav file.
-    sample_rate : int, default=16000
-        Target sample rate in Hz. We use 16,000 Hz because standard speech models
-        (Whisper, Silero, Wav2Vec2) are trained on 16 kHz audio.
-    channels : int, default=1
-        Number of audio channels. 1 = Mono. Downmixing to mono saves 50% RAM and compute.
-    overwrite : bool, default=False
-        If False and output_path already exists, skips extraction to avoid redundant disk I/O.
-
-    Returns:
-    --------
-    Path: Absolute Path object pointing to the extracted WAV file.
+    This function coordinates the extraction workflow:
+        1. Check FFmpeg availability.
+        2. Prepare and validate file paths.
+        3. Reuse an existing output when possible.
+        4. Build the FFmpeg command.
+        5. Execute extraction.
+        6. Finalize the output file.
     """
-    # Ensure FFmpeg is accessible before doing any work
-    check_ffmpeg_available()
 
-    # Convert paths to absolute Path objects to avoid issues with relative directories
-    input_file = Path(input_path).resolve()
-    output_file = Path(output_path).resolve()
+    # STEP 1: Make sure FFmpeg is available.
+    ffmpeg_exe = check_ffmpeg_available()
 
-    # Safety Check 1: The input file must actually exist on disk
-    if not input_file.exists():
-        raise FileNotFoundError(f"Input media file not found: {input_file}")
+    # STEP 2: Prepare and validate input/output paths.
+    input_file, output_file = _prepare_audio_paths(
+        input_path,
+        output_path
+    )
 
-    # Safety Check 2: Never overwrite the raw source file
-    if input_file == output_file:
-        raise ValueError("Input and output paths cannot be the same. Never overwrite original source.")
-
-    # Idempotency Check: If output already exists and overwrite is False, reuse it
+    # STEP 3: Avoid unnecessary extraction if output already exists.
     if output_file.exists() and not overwrite:
-        print(f"[audio_extractor] Output already exists, skipping re-extraction: {output_file.name}")
+        print(
+            f"[audio_extractor] Output already exists, "
+            f"skipping re-extraction: {output_file.name}"
+        )
         return output_file
 
-    # Ensure the parent folder (e.g., data/processed/) exists before writing into it
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    # STEP 4: Create a temporary output filename.
+    temporary_file = output_file.with_name(
+        output_file.stem + ".part.wav"
+    )
 
-    # Build the FFmpeg command line arguments:
-    # ffmpeg -y/-n -i <input> -vn -ac 1 -ar 16000 -sample_fmt s16 <output>
+    # Remove any leftover temporary file from a previous failed run.
+    temporary_file.unlink(missing_ok=True)
+
+    # STEP 5: Construct the FFmpeg command.
     cmd = [
-        "ffmpeg",
-        "-y" if overwrite else "-n",  # -y forces overwrite; -n cancels if file exists
-        "-i", str(input_file),        # -i specifies the input media file
-        "-vn",                        # -vn disables video recording (strips any video streams)
-        "-ac", str(channels),         # -ac sets the number of audio channels (1 = mono)
-        "-ar", str(sample_rate),      # -ar sets audio sampling rate in Hz (16000)
-        "-sample_fmt", "s16",         # -sample_fmt sets audio sample format to signed 16-bit PCM
-        str(output_file)              # Target output WAV destination
+    ffmpeg_exe,
+    "-nostdin",
+    "-y" if overwrite else "-n",
+    "-i", str(input_file),
+    "-vn",
+    "-ac", str(channels),
+    "-ar", str(sample_rate),
+    "-sample_fmt", "s16",
+    str(temporary_file)
     ]
 
-    print(f"[audio_extractor] Extracting: {input_file.name} -> {output_file.name}")
+    # STEP 6: Execute FFmpeg.
+    _run_ffmpeg(
+        cmd=cmd,
+        temporary_file=temporary_file,
+        input_file=input_file,
+        output_file=output_file
+    )
 
-    # Execute the command via subprocess
-    # stdout and stderr are captured as text pipes for clean error reporting
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # STEP 7: Move the completed WAV to its final location.
+    return _finalize_audio(
+        temporary_file,
+        output_file
+    )
 
-    # If FFmpeg exited with any code other than 0, an error occurred
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"FFmpeg extraction failed with return code {result.returncode}:\n{result.stderr}"
-        )
-
-    return output_file
 
 
 def validate_audio(
@@ -234,6 +303,8 @@ def validate_audio(
         errors.append(f"Channel mismatch: expected {expected_channels} (mono), got {info.channels}")
     if info.subtype != expected_subtype:
         errors.append(f"Subtype mismatch: expected {expected_subtype}, got {info.subtype}")
+    if info.frames == 0:
+        errors.append("File contains no audio frames")
     if info.format != "WAV":
         errors.append(f"Format mismatch: expected WAV, got {info.format}")
 

@@ -36,7 +36,9 @@ Decision Fusion Table:
 Important Limitations (documented per assignment requirements):
   - VAD is NOT a complete 4-class classifier; it only detects voice presence.
   - The confidence score is a heuristic measure, NOT a calibrated probability.
-  - Music detection uses spectral flatness as a proxy, which is imperfect.
+  - Spectral flatness is computed but does NOT influence the labels (it read ~0.012
+    for both speech and silence on lecture audio); music is inferred from loud frames
+    with low VAD probability, which is imperfect.
   - All automatic labels are suggestions; human correction is expected in Stage 10.
 """
 
@@ -83,7 +85,7 @@ if sys.platform == "win32":
 # Frame size for energy analysis: 50 ms = 800 samples at 16 kHz
 FRAME_SIZE_SAMPLES = 800
 
-# RMS energy threshold (in dB below peak) to consider a frame as "low energy"
+# RMS energy threshold (in dBFS, i.e. relative to full scale) to consider a frame as "low energy"
 # In classroom/lecture recordings, background room tone (AC, projector fan) sits around -33 to -36 dB,
 # while active speech sits around -20 to -26 dB.
 # Setting this threshold to -31.0 dB correctly identifies ambient room tone as silence.
@@ -118,7 +120,7 @@ def compute_frame_energy_db(audio: np.ndarray, frame_size: int = FRAME_SIZE_SAMP
     RMS (Root Mean Square) measures the average loudness of a frame:
       RMS = sqrt( (1/N) * sum(x[i]^2) )
 
-    We convert to decibels relative to peak (1.0 for normalized audio):
+    We convert to decibels relative to full scale (1.0 = 0 dBFS):
       dB = 20 * log10(RMS)
 
     Parameters:
@@ -166,7 +168,7 @@ def compute_frame_spectral_flatness(
       - SFM near 0.0 (Spiky/Tonal Spectrum): Energy is concentrated in discrete harmonic
         peaks. This is characteristic of musical instruments, melodies, and chords.
 
-    This metric prevents ambient room tone / projector noise from being misclassified as music.
+    NOTE: currently computed for diagnostics only; classify_frames() does not use it.
     """
     num_frames = len(audio) // frame_size
     frames = audio[:num_frames * frame_size].reshape(num_frames, frame_size)
@@ -261,7 +263,8 @@ def run_silero_vad_chunked(
         micro_duration = vad_window / sr                       # 0.032 seconds
         frame_duration = FRAME_SIZE_SAMPLES / sr               # 0.050 seconds
 
-        for fi in range(total_frames):
+        for fi in range(chunk_start // FRAME_SIZE_SAMPLES,
+                        min(total_frames, -(-chunk_end // FRAME_SIZE_SAMPLES))):
             # Calculate the global sample range for this analysis frame
             frame_global_start = fi * FRAME_SIZE_SAMPLES
             frame_global_end = frame_global_start + FRAME_SIZE_SAMPLES
@@ -294,7 +297,7 @@ def classify_frames(
     For each frame, it combines:
       - Energy level (from compute_frame_energy_db)
       - VAD speech probability (from run_silero_vad_chunked)
-      - Spectral Flatness Measure (from compute_frame_spectral_flatness)
+      - Spectral Flatness Measure (accepted but NOT used by the current decision rules)
 
     And assigns one of: 'speech', 'silence', 'music', or 'mixed'.
 

@@ -64,10 +64,6 @@ METADATA_DIR = PROJECT_ROOT / "metadata"
 
 
 def get_ytdlp_version() -> str:
-    """
-    Returns the currently installed yt-dlp version as a string.
-    Recording the tool version in metadata is required for scientific reproducibility.
-    """
     return yt_dlp.version.__version__
 
 
@@ -90,6 +86,7 @@ def fetch_video_metadata(url: str) -> Dict[str, Any]:
     
     ydl_opts = {
         "quiet": True,
+        "noplaylist": True,
         "no_warnings": True,
       
     }
@@ -103,15 +100,12 @@ def fetch_video_metadata(url: str) -> Dict[str, Any]:
 
 
 def sanitize_title(title: str, max_length: int = 50) -> str:
-    """
-    Sanitizes a video title so it can be safely used in Windows/Linux file paths.
-    Replaces illegal characters (\\ / : * ? " < > |) and spaces with clean underscores.
-    Preserves Arabic and alphanumeric text, truncating to max_length to avoid Windows PATH limits.
-    """
     if not title:
         return "audio"
     # Replace characters not allowed in Windows filenames with an underscore
     cleaned = re.sub(r'[\\/*?:"<>|#%&{}\\<>*?/$!\'":@+`|=]', "_", title)
+    # Drop emoji/symbols; \w keeps Arabic and Latin letters and digits.
+    cleaned = re.sub(r"[^\w\s-]", "_", cleaned)  # drop emoji/symbols
     # Collapse multiple consecutive underscores or whitespace into a single underscore
     cleaned = re.sub(r"[\s_]+", "_", cleaned).strip("._ ")
     if len(cleaned) > max_length:
@@ -143,6 +137,229 @@ def find_existing_processed_wav(video_id: str) -> Optional[Path]:
             return candidate
     return None
 
+def validate_directs():
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+    return None
+
+
+def download_audio(url: str, stem: str, id: str) -> Path:
+
+    raw_path = find_existing_raw_file(id)
+
+    if raw_path:
+        print(
+            f"Found existing raw media on disk: {raw_path.name} "
+            f"({raw_path.stat().st_size / (1024 * 1024):.1f} MB)"
+        )
+
+    else:
+        print(f"No local file found. Downloading raw audio: {stem}")
+
+        ydl_download_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(RAW_DIR / f"{stem}.%(ext)s"),
+            "quiet": False,
+            "noplaylist": True,
+            "no_warnings": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
+            ydl.download([url])
+
+        raw_path = find_existing_raw_file(id)
+
+        if not raw_path:
+            raise FileNotFoundError(
+                f"Failed to find downloaded file for video ID: {id}"
+            )
+
+    return raw_path
+
+
+
+# ============================================================
+# INGESTION HELPER FUNCTIONS
+# ============================================================
+
+def get_video_id(info: Dict[str, Any], url: str) -> str:
+    
+
+    video_id = info.get("id")
+
+    if not video_id:
+        raise ValueError(
+            f"Could not determine video ID from URL: {url}"
+        )
+
+    return video_id
+
+
+
+
+
+def prepare_processed_audio(
+    raw_path: Path,
+    video_id: str,
+    file_stem: str
+) -> Path:
+    """
+    Find an existing processed WAV or generate a new one.
+
+    The output is standardized to:
+        - 16 kHz sample rate
+        - Mono (1 channel)
+        - 16-bit PCM
+
+    Reuses an existing WAV to avoid unnecessary processing.
+    """
+
+    # Check whether this video already has a processed WAV.
+    existing_wav = find_existing_processed_wav(video_id)
+
+    if existing_wav:
+        print(
+            f"[ingest] Reusing processed audio: "
+            f"{existing_wav.name}"
+        )
+        return existing_wav
+
+    # Define where the newly extracted WAV will be stored.
+    output_path = PROCESSED_DIR / f"{file_stem}.wav"
+
+    print("[ingest] Extracting standardized audio...")
+
+    # Convert the original media into our standardized WAV.
+    return extract_audio(
+        input_path=raw_path,
+        output_path=output_path,
+        sample_rate=16000,
+        channels=1,
+        overwrite=False
+    )
+
+
+
+
+def build_metadata_record(
+    url: str,
+    info: Dict[str, Any],
+    video_id: str,
+    notes: Optional[str],
+    custom_license: Optional[str],
+    raw_path: Path,
+    extracted_wav: Path,
+    audio_validation: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Construct the complete metadata dictionary.
+
+    Combines:
+        - Original video information from yt-dlp
+        - Raw media file information
+        - Processed audio properties
+        - Ingestion history and timestamps
+
+    Does not write anything to disk.
+    """
+
+    metadata_record = {
+        # Basic source identification.
+        "video_id": video_id,
+        "source_url": url,
+        "title": info.get("title"),
+
+        # Information about the original uploader.
+        "channel": info.get("uploader") or info.get("channel"),
+        "channel_id": info.get("channel_id") or info.get("uploader_id"),
+        "upload_date": info.get("upload_date"),
+
+        # Original video properties.
+        "duration_seconds": info.get("duration"),
+        "description": (
+            info.get("description", "")[:500]
+            if info.get("description") else None
+        ),
+
+        # Language and licensing information.
+        "language_reported": info.get("language") or "ar",
+        "license_reported": (
+            custom_license or info.get("license") or "NA"
+        ),
+
+        # User-provided notes and permissions.
+        "notes": notes,
+
+        # Record how and when the original media was acquired.
+        "ingestion_info": {
+            "tool": "yt-dlp",
+            "tool_version": get_ytdlp_version(),
+            "ingested_at_utc": datetime.now(timezone.utc).isoformat(),
+
+            # Store relative paths to keep metadata portable.
+            "raw_file": raw_path.relative_to(
+                PROJECT_ROOT
+            ).as_posix(),
+
+            "raw_size_bytes": raw_path.stat().st_size,
+        },
+
+        # Record the properties of the standardized WAV.
+        "audio_properties": {
+            "processed_file": extracted_wav.relative_to(
+                PROJECT_ROOT
+            ).as_posix(),
+
+            "sample_rate": audio_validation["samplerate"],
+            "channels": audio_validation["channels"],
+            "subtype": audio_validation["subtype"],
+            "format": audio_validation["format"],
+            "duration_seconds": audio_validation["duration_seconds"],
+            "total_frames": audio_validation["frames"],
+        }
+    }
+
+    return metadata_record
+
+
+def save_metadata(
+    metadata_record: Dict[str, Any]
+) -> Path:
+    """
+    Save the metadata dictionary as a JSON file.
+
+    Each video gets its own metadata file named after
+    its unique video ID.
+
+    Returns the path of the saved JSON file.
+    """
+
+    video_id = metadata_record["video_id"]
+    
+
+    metadata_json_path = METADATA_DIR / f"{video_id}.json"
+
+    # Write JSON using UTF-8 to preserve Arabic characters.
+    with open(metadata_json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            metadata_record,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    print(
+        f"[ingest] Metadata successfully recorded to: "
+        f"{metadata_json_path.name}"
+    )
+
+    return metadata_json_path
+
+
+# ============================================================
+# MAIN INGESTION ORCHESTRATOR
+# ============================================================
 
 def ingest_video(
     url: str,
@@ -150,128 +367,104 @@ def ingest_video(
     custom_license: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Executes the end-to-end ingestion and registration pipeline:
-      1. Fetches metadata and parses the unique video ID.
-      2. Detects local media in data/raw/ or downloads best available audio.
-      3. Invokes Stage 2 audio extraction to create data/processed/<video_id>.wav.
-      4. Programmatically validates the extracted audio.
-      5. Constructs and writes metadata/<video_id>.json.
+    Coordinate the complete video ingestion workflow.
 
-    Parameters:
-    -----------
-    url : str
-        The video URL to process.
-    notes : str, optional
-        Custom context note (e.g. lecturer permission, academic recording details).
-    custom_license : str, optional
-        Explicit license override if the YouTube API reports 'NA'.
+    This function does not implement the individual operations.
+    Instead, it calls specialized helper functions in the
+    correct order and passes data between them.
 
-    Returns:
-    --------
-    dict : The complete saved metadata dictionary.
+    Workflow:
+        1. Prepare project directories.
+        2. Fetch video metadata.
+        3. Identify the video.
+        4. Find or download original media.
+        5. Find or extract standardized audio.
+        6. Validate processed audio.
+        7. Build metadata record.
+        8. Save metadata record.
+
+    Returns the complete metadata dictionary.
     """
-    # Ensure the destination directories exist on disk
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --------------------------------------------------------
+    # STEP 1: Ensure all required project directories exist.
+    # --------------------------------------------------------
+
+    validate_directs()
+
+    # --------------------------------------------------------
+    # STEP 2: Retrieve video metadata without downloading it.
+    # --------------------------------------------------------
 
     print(f"\n[ingest] Fetching metadata for: {url}")
+
     info = fetch_video_metadata(url)
-    video_id = info.get("id")
-    title = info.get("title", "")
 
-    # Safety check: every online video must have a unique identifier
-    if not video_id:
-        raise ValueError(f"Could not determine video ID from URL: {url}")
+    # --------------------------------------------------------
+    # STEP 3: Extract the video ID and prepare its file name.
+    # --------------------------------------------------------
 
-    # Build human-readable file stem: <Sanitized_Title>_<video_id>
-    # e.g., DSP_Elective_2_Lecture_1_gK017cCH36k
-    safe_title = sanitize_title(title)
+    video_id = get_video_id(info, url)
+
+    safe_title = sanitize_title(info.get("title", ""))
+
     file_stem = f"{safe_title}_{video_id}"
 
-    # Check if we already have the raw recording saved on disk
-    raw_path = find_existing_raw_file(video_id)
+    # --------------------------------------------------------
+    # STEP 4: Acquire the original raw media file.
+    # Reuses an existing file or downloads it if necessary.
+    # --------------------------------------------------------
 
-    if raw_path:
-        # File is already on disk: reuse it to avoid bandwidth and throttling
-        print(f"[ingest] Found existing raw media on disk: {raw_path.name} ({raw_path.stat().st_size / (1024*1024):.1f} MB)")
-    else:
-        # File is not on disk: download best available audio stream
-        print(f"[ingest] No local file found. Downloading raw audio: {file_stem}")
-        ydl_download_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": str(RAW_DIR / f"{file_stem}.%(ext)s"),
-            "quiet": False,
-            "no_warnings": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
-            ydl.download([url])
+    raw_path = download_audio(
+    url=url,
+    stem=file_stem,
+    id=video_id
+)
 
-        # Verify that the download successfully produced a valid file
-        raw_path = find_existing_raw_file(video_id)
-        if not raw_path:
-            raise FileNotFoundError(f"Failed to find downloaded file for video ID: {video_id}")
+    # --------------------------------------------------------
+    # STEP 5: Prepare the standardized 16 kHz WAV file.
+    # Reuses an existing processed file when available.
+    # --------------------------------------------------------
 
-    # --- Stage 2 Execution: Audio Extraction ---
-    # Check if a 16 kHz WAV already exists for this video (matches either old ID or new title+ID)
-    existing_wav = find_existing_processed_wav(video_id)
-    processed_wav_path = existing_wav if existing_wav else (PROCESSED_DIR / f"{file_stem}.wav")
-
-    # Extract 16 kHz mono 16-bit PCM WAV using our audio_extractor module
-    extracted_wav = extract_audio(
-        input_path=raw_path,
-        output_path=processed_wav_path,
-        sample_rate=16000,
-        channels=1,
-        overwrite=False
+    extracted_wav = prepare_processed_audio(
+        raw_path=raw_path,
+        video_id=video_id,
+        file_stem=file_stem
     )
 
-    # Programmatically validate the extracted audio file using SoundFile
+    # --------------------------------------------------------
+    # STEP 6: Validate the processed audio properties.
+    # --------------------------------------------------------
     audio_validation = validate_audio(extracted_wav)
-    print(f"[ingest] Audio validated: {audio_validation['duration_seconds']}s, 16kHz, mono, PCM_16")
+    print(
+    f"[ingest] Audio validated: "
+    f"{audio_validation['duration_seconds']}s, "
+    f"16kHz, mono, PCM_16"
+)
 
-    # --- Stage 1 Output: Construct the Formal Metadata Record ---
-    metadata_record = {
-        "video_id": video_id,
-        "source_url": url,
-        "title": info.get("title"),
-        "channel": info.get("uploader") or info.get("channel"),
-        "channel_id": info.get("channel_id") or info.get("uploader_id"),
-        "upload_date": info.get("upload_date"),
-        "duration_seconds": info.get("duration"),
-        # Preserve first 500 characters of description if available
-        "description": info.get("description", "")[:500] if info.get("description") else None,
-        "language_reported": info.get("language") or "ar",
-        "license_reported": custom_license or info.get("license") or "NA",
-        "notes": notes,
-        "ingestion_info": {
-            "tool": "yt-dlp",
-            "tool_version": get_ytdlp_version(),
-            "ingested_at_utc": datetime.now(timezone.utc).isoformat(),
-            # Record relative paths so the metadata remains portable across machines
-            "raw_file": str(raw_path.relative_to(PROJECT_ROOT)),
-            "raw_size_bytes": raw_path.stat().st_size,
-        },
-        "audio_properties": {
-            "processed_file": str(extracted_wav.relative_to(PROJECT_ROOT)),
-            "sample_rate": audio_validation["samplerate"],
-            "channels": audio_validation["channels"],
-            "subtype": audio_validation["subtype"],
-            "format": audio_validation["format"],
-            "duration_seconds": audio_validation["duration_seconds"],
-            "total_frames": audio_validation["frames"]
-        }
-    }
+    # --------------------------------------------------------
+    # STEP 7: Construct the complete metadata dictionary.
+    # --------------------------------------------------------
 
-    # Write the formatted metadata to metadata/<video_id>.json
-    metadata_json_path = METADATA_DIR / f"{video_id}.json"
-    with open(metadata_json_path, "w", encoding="utf-8") as f:
-        # indent=2 formats with clean indentation; ensure_ascii=False preserves Arabic text
-        json.dump(metadata_record, f, indent=2, ensure_ascii=False)
+    metadata_record = build_metadata_record(
+        url=url,
+        info=info,
+        video_id=video_id,
+        notes=notes,
+        custom_license=custom_license,
+        raw_path=raw_path,
+        extracted_wav=extracted_wav,
+        audio_validation=audio_validation
+    )
 
-    print(f"[ingest] Metadata successfully recorded to: {metadata_json_path.name}")
+    # --------------------------------------------------------
+    # STEP 8: Save the metadata record as a JSON file.
+    # --------------------------------------------------------
+
+    save_metadata(metadata_record)
+
+    # Return the metadata so other modules can use it.
     return metadata_record
-
 
 # --- Command-Line Entry Point ---
 if __name__ == "__main__":

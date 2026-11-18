@@ -1,188 +1,222 @@
 """
-src/segmenter.py
-================
-Stage 5: Speech Segmentation
+src/segmenter.py  -  Stage 5: Speech Segmentation (v2: pause-based cuts)
+=========================================================================
 
-Purpose:
---------
-Transforms continuous speech and mixed regions (from Stage 4) into individual,
-standardized audio clips suitable for speech recognition (ASR) training and evaluation.
+Turns Stage 4 speech/mixed regions into 5-15 s clips (target 8-12 s) that do not
+start or end in the middle of a word.
 
-Mandatory Project Constraints:
-  1. Duration Range: 5.0 to 15.0 seconds per clip (target: 8.0 to 12.0 seconds).
-  2. Word Boundary Preservation: Never knowingly slice through a spoken word.
-     Cuts are placed at natural energy troughs (micro-pauses between words).
-  3. Edge Silence Cushion: Preserves ~0.15s of silence at the start and end of each
-     clip so initial and final consonants are not clipped.
-  4. Stable Naming: Each clip receives a unique, zero-padded identifier:
-     <video_id>_seg_000001.wav, <video_id>_seg_000002.wav, etc.
-  5. Audit Readiness: Records boundary verification status for each segment
-     ('auto_verified' vs 'flagged_manual_review').
+What changed from v1 (and why)
+------------------------------
+v1 cut at the single quietest 50 ms frame and then added 0.15 s of padding on
+BOTH sides of EVERY cut.  That is right for the outer edges of a region (silence
+follows) but wrong for a cut through continuous speech: when the pause at the
+cut is shorter than 0.3 s, each clip's padding reaches into the neighbouring
+word, so a clip ends with the first syllable of the next word and the next clip
+starts with the tail of the previous one.  v1 also judged "is this a clean cut?"
+with a fixed -28 dBFS, which says nothing about how loud THIS recording is.
+
+v2:
+ 1. Finds real PAUSES: runs of 20 ms frames that are at least PAUSE_DEPTH_DB below
+    the local speech level and last at least MIN_PAUSE_SEC.  Closures inside words
+    (stops such as b/t/k) are shorter than that and are ignored.
+ 2. Cuts at the CENTRE of the longest such pause in the 8-12 s window; if none,
+    it widens the window to 6-14 s; if still none it falls back to the smoothed
+    energy minimum and flags the cut for manual review.
+ 3. At an internal cut, padding is limited to 40 % of the pause length (so it stays
+    inside the pause).  The full 0.15 s cushion is kept only at the outer edges of a
+    region.
+ 4. "auto_verified" now means "cut sits in a real pause"; each segment also records
+    pause_ms and pause_depth_db so you can audit it.
+
+Public names kept from v1: find_best_cut_point (2-tuple), find_best_cut_point_with_energy
+(3-tuple), segment_speech_region, export_segments (same signature and record fields,
+plus cut_energy_db, pause_ms, pause_depth_db).  boundary_method is now "energy_pause_v2".
 """
 
 import sys
-import os
 from pathlib import Path
 
-# Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import json
-from typing import List, Dict, Any, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import soundfile as sf
 
-from src.classifier import compute_frame_energy_db, FRAME_SIZE_SAMPLES
-
+from src.classifier import compute_frame_energy_db, FRAME_SIZE_SAMPLES  # noqa: F401  (FRAME_SIZE_SAMPLES re-exported)
 
 SEGMENTS_DIR = PROJECT_ROOT / "data" / "segments"
 
-# Target duration limits (in seconds)
+# Clip length limits (seconds, including padding)
 MIN_SEGMENT_DURATION_SEC = 5.0
 MAX_SEGMENT_DURATION_SEC = 15.0
 TARGET_DURATION_MIN_SEC = 8.0
 TARGET_DURATION_MAX_SEC = 12.0
 
-# Silence cushion / padding added to segment boundaries (in seconds)
+# Cushion at the OUTER edges of a region
 PADDING_SEC = 0.15
 
+# --- v2 pause detection ---
+CUT_FRAME_SAMPLES = 320            # 20 ms frames at 16 kHz
+MIN_PAUSE_SEC = 0.15               # shorter dips are word-internal closures, not pauses
+PAUSE_DEPTH_DB = 15.0              # a pause frame is >= 15 dB below the local speech level
+SPEECH_LEVEL_PERCENTILE = 75.0     # "local speech level" = 75th percentile of frame energy
+PRIMARY_WINDOW_SEC = (TARGET_DURATION_MIN_SEC, TARGET_DURATION_MAX_SEC)
+WIDE_WINDOW_SEC = (6.0, 14.0)      # used only when the primary window has no real pause
+PAD_FRACTION_OF_PAUSE = 0.4        # internal-cut padding = 40 % of the pause (<= PADDING_SEC)
 
-def find_best_cut_point(
+BOUNDARY_METHOD = "energy_pause_v2"
+
+
+# --------------------------------------------------------------------------- #
+# Cut-point search
+# --------------------------------------------------------------------------- #
+def _frame_energy(audio: np.ndarray, sr: int, start_sec: float, end_sec: float) -> np.ndarray:
+    """20 ms frame energies (dBFS) for audio[start_sec:end_sec]; empty if too short."""
+    s = max(0, int(start_sec * sr))
+    e = min(len(audio), int(end_sec * sr))
+    chunk = audio[s:e]
+    if len(chunk) < CUT_FRAME_SAMPLES:
+        return np.empty(0, dtype=np.float64)
+    return compute_frame_energy_db(chunk, frame_size=CUT_FRAME_SAMPLES)
+
+
+def _pause_runs(is_pause: np.ndarray, min_frames: int) -> List[Tuple[int, int]]:
+    """(start, end_exclusive) of every run of True values at least min_frames long."""
+    runs: List[Tuple[int, int]] = []
+    i, n = 0, len(is_pause)
+    while i < n:
+        if is_pause[i]:
+            j = i
+            while j < n and is_pause[j]:
+                j += 1
+            if j - i >= min_frames:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def find_cut_point_details(
     audio: np.ndarray,
     sr: int,
     region_start_sec: float,
     current_cut_sec: float,
-    region_end_sec: float
-) -> Tuple[float, str]:
-    """
-    Finds the optimal timestamp to place a cut within a long speech region.
+    region_end_sec: float,
+) -> Dict[str, Any]:
+    """Choose where the clip that starts at current_cut_sec should end.
 
-    How it works:
-    -------------
-    1. Defines a search window around 8 to 12 seconds from current_cut_sec.
-    2. Within that window, scans 50 ms RMS energy frames.
-    3. Finds the local energy minimum (trough) where sound level is lowest.
-    4. If the quietest point is below -28 dB → confident natural pause ('auto_verified').
-       If the quietest point is louder → speech was continuous ('flagged_manual_review').
-
-    Parameters:
-    -----------
-    audio : np.ndarray
-        Full audio array.
-    sr : int
-        Sample rate (16000 Hz).
-    region_start_sec : float
-        Absolute start timestamp of the entire speech region.
-    current_cut_sec : float
-        Where the current segment started.
-    region_end_sec : float
-        Absolute end timestamp of the entire speech region.
-
-    Returns:
-    --------
-    Tuple[float, str] : (cut_timestamp_sec, boundary_status)
+    Returns a dict: cut_sec, status ('auto_verified' | 'flagged_manual_review'),
+    cut_energy_db, pause_sec, pause_depth_db (None when not applicable).
     """
     remaining_sec = region_end_sec - current_cut_sec
+    if remaining_sec <= MAX_SEGMENT_DURATION_SEC:          # the rest fits in one clip
+        return {"cut_sec": region_end_sec, "status": "auto_verified",
+                "cut_energy_db": None, "pause_sec": None, "pause_depth_db": None}
 
-    # If what remains is already within the acceptable range (<= 15s), take all of it
-    if remaining_sec <= MAX_SEGMENT_DURATION_SEC:
-        return region_end_sec, "auto_verified"
+    frame_sec = CUT_FRAME_SAMPLES / sr
+    min_frames = int(round(MIN_PAUSE_SEC / frame_sec))
 
-    # Define the search window for candidate cut points:
-    # Look between 8.0s and 12.0s after current_cut_sec
-    search_start_sec = current_cut_sec + TARGET_DURATION_MIN_SEC
-    search_end_sec = min(current_cut_sec + TARGET_DURATION_MAX_SEC, region_end_sec - MIN_SEGMENT_DURATION_SEC)
+    # Local speech level from the stretch this clip could cover
+    span = _frame_energy(audio, sr, current_cut_sec,
+                         min(current_cut_sec + MAX_SEGMENT_DURATION_SEC, region_end_sec))
+    speech_db: Optional[float] = None
+    if span.size >= 10:
+        speech_db = float(np.percentile(span, SPEECH_LEVEL_PERCENTILE))
+        threshold = speech_db - PAUSE_DEPTH_DB
+        target_time = current_cut_sec + 0.5 * (PRIMARY_WINDOW_SEC[0] + PRIMARY_WINDOW_SEC[1])
 
-    # Convert seconds to sample indices
-    search_start_frame = int(search_start_sec * sr)
-    search_end_frame = int(search_end_sec * sr)
+        for w_lo, w_hi in (PRIMARY_WINDOW_SEC, WIDE_WINDOW_SEC):
+            win_start = current_cut_sec + w_lo
+            win_end = min(current_cut_sec + w_hi, region_end_sec - MIN_SEGMENT_DURATION_SEC)
+            if win_end - win_start < 2 * frame_sec:
+                continue
+            energy = _frame_energy(audio, sr, win_start, win_end)
+            if energy.size == 0:
+                continue
+            runs = _pause_runs(energy < threshold, min_frames)
+            if not runs:
+                continue
 
-    search_slice = audio[search_start_frame:search_end_frame]
-    if len(search_slice) < FRAME_SIZE_SAMPLES * 2:
-        # Fallback if window is too small: cut at 10 seconds
-        fallback_cut = min(current_cut_sec + 10.0, region_end_sec)
-        return fallback_cut, "flagged_manual_review"
+            def score(run: Tuple[int, int]) -> Tuple[int, float]:
+                centre_t = win_start + 0.5 * (run[0] + run[1]) * frame_sec
+                return (run[1] - run[0], -abs(centre_t - target_time))   # longest, then nearest 10 s
 
-    # Compute frame energy in 50 ms steps across the search window
-    frame_energy = compute_frame_energy_db(search_slice, frame_size=FRAME_SIZE_SAMPLES)
+            lo, hi = max(runs, key=score)
+            mean_db = float(np.mean(energy[lo:hi]))
+            return {"cut_sec": win_start + 0.5 * (lo + hi) * frame_sec,
+                    "status": "auto_verified",
+                    "cut_energy_db": mean_db,
+                    "pause_sec": (hi - lo) * frame_sec,
+                    "pause_depth_db": speech_db - mean_db}
 
-    # Find the frame with the lowest energy (deepest trough)
-    best_frame_idx = int(np.argmin(frame_energy))
-    best_energy_db = frame_energy[best_frame_idx]
+    # Fallback: no real pause anywhere -> smoothed energy minimum, flagged for review
+    win_start = current_cut_sec + PRIMARY_WINDOW_SEC[0]
+    win_end = min(current_cut_sec + PRIMARY_WINDOW_SEC[1], region_end_sec - MIN_SEGMENT_DURATION_SEC)
+    energy = _frame_energy(audio, sr, win_start, win_end) if win_end > win_start else np.empty(0)
+    if energy.size < 3:
+        return {"cut_sec": min(current_cut_sec + 10.0, region_end_sec),
+                "status": "flagged_manual_review",
+                "cut_energy_db": None, "pause_sec": 0.0, "pause_depth_db": None}
+    smooth = np.convolve(energy, np.ones(3) / 3.0, mode="same")
+    idx = int(np.argmin(smooth))
+    return {"cut_sec": win_start + (idx + 0.5) * frame_sec,
+            "status": "flagged_manual_review",
+            "cut_energy_db": float(energy[idx]),
+            "pause_sec": 0.0,
+            "pause_depth_db": None if speech_db is None else speech_db - float(energy[idx])}
 
-    # Convert best frame back to absolute seconds
-    offset_sec = (best_frame_idx * FRAME_SIZE_SAMPLES) / sr
-    best_cut_sec = search_start_sec + offset_sec
 
-    # Assess boundary quality:
-    # If energy at cut point is below -28 dB, it's a clear acoustic gap between words
-    if best_energy_db < -28.0:
-        status = "auto_verified"
-    else:
-        # Energy was still somewhat elevated; flag for human annotator review
-        status = "flagged_manual_review"
+def find_best_cut_point_with_energy(
+    audio: np.ndarray, sr: int, region_start_sec: float,
+    current_cut_sec: float, region_end_sec: float,
+) -> Tuple[float, str, Optional[float]]:
+    """(cut_sec, status, cut_energy_db) - same shape as the v1 patched function."""
+    d = find_cut_point_details(audio, sr, region_start_sec, current_cut_sec, region_end_sec)
+    return d["cut_sec"], d["status"], d["cut_energy_db"]
 
-    return best_cut_sec, status
+
+def find_best_cut_point(
+    audio: np.ndarray, sr: int, region_start_sec: float,
+    current_cut_sec: float, region_end_sec: float,
+) -> Tuple[float, str]:
+    """Backward-compatible 2-tuple: (cut_sec, status)."""
+    cut, status, _ = find_best_cut_point_with_energy(
+        audio, sr, region_start_sec, current_cut_sec, region_end_sec)
+    return cut, status
+
+
+# --------------------------------------------------------------------------- #
+# Region -> segment definitions
+# --------------------------------------------------------------------------- #
+def _internal_pad(pause_sec: Optional[float], padding_sec: float) -> float:
+    """Padding allowed at a cut THROUGH speech: stays inside the pause."""
+    if not pause_sec:
+        return 0.0
+    return min(padding_sec, PAD_FRACTION_OF_PAUSE * pause_sec)
 
 
 def segment_speech_region(
     audio: np.ndarray,
     sr: int,
     region: Dict[str, Any],
-    padding_sec: float = PADDING_SEC
+    padding_sec: float = PADDING_SEC,
 ) -> List[Dict[str, Any]]:
-    """
-    Splits a single classified speech region into one or more 5–15 second segments.
-
-    Parameters:
-    -----------
-    audio : np.ndarray
-        Full 16 kHz audio array.
-    sr : int
-        Sample rate (16000).
-    region : dict
-        A region record with 'start_sec', 'end_sec', 'label', 'confidence'.
-    padding_sec : float
-        Silence cushion added to the start and end of each segment.
-
-    Returns:
-    --------
-    List[dict] : One or more segment boundary dictionaries.
-    """
+    """Split one speech/mixed region into 5-15 s segments (3-5 s fragments are kept whole)."""
     reg_start = region["start_sec"]
     reg_end = region["end_sec"]
     total_audio_sec = len(audio) / sr
 
-    # Only segment 'speech' and 'mixed' regions (skip silence and music)
     if region["label"] not in ("speech", "mixed"):
         return []
 
     duration = reg_end - reg_start
 
-    # Case 1: Region is shorter than 5 seconds
-    # In corpus construction, isolated speech fragments < 5s are kept with a note
-    # if they are >= 3.0s, otherwise skipped
-    if duration < MIN_SEGMENT_DURATION_SEC:
-        if duration >= 3.0:
-            padded_start = max(0.0, reg_start - padding_sec)
-            padded_end = min(total_audio_sec, reg_end + padding_sec)
-            return [{
-                "start_sec": round(padded_start, 3),
-                "end_sec": round(padded_end, 3),
-                "duration_sec": round(padded_end - padded_start, 3),
-                "region_label": region["label"],
-                "confidence_score": region.get("confidence", 1.0),
-                "boundary_method": "whole_short_region",
-                "boundary_check": "auto_verified",
-            }]
-        else:
-            # Fragment is too tiny (< 3.0s), skip it
-            return []
-
-    # Case 2: Region is already in the sweet spot (5.0s to 15.0s)
-    if duration <= MAX_SEGMENT_DURATION_SEC:
+    def whole(method: str) -> List[Dict[str, Any]]:
         padded_start = max(0.0, reg_start - padding_sec)
         padded_end = min(total_audio_sec, reg_end + padding_sec)
         return [{
@@ -191,25 +225,29 @@ def segment_speech_region(
             "duration_sec": round(padded_end - padded_start, 3),
             "region_label": region["label"],
             "confidence_score": region.get("confidence", 1.0),
-            "boundary_method": "whole_region_fit",
+            "boundary_method": method,
             "boundary_check": "auto_verified",
+            "cut_energy_db": None, "pause_ms": None, "pause_depth_db": None,
         }]
 
-    # Case 3: Region is longer than 15.0s → split iteratively using energy troughs
-    segments = []
+    if duration < MIN_SEGMENT_DURATION_SEC:
+        return whole("whole_short_region") if duration >= 3.0 else []
+    if duration <= MAX_SEGMENT_DURATION_SEC:
+        return whole("whole_region_fit")
+
+    segments: List[Dict[str, Any]] = []
     current_start = reg_start
-
+    start_pad = padding_sec            # outer edge of the region: full cushion
     while current_start < reg_end:
-        cut_point, status = find_best_cut_point(audio, sr, reg_start, current_start, reg_end)
+        d = find_cut_point_details(audio, sr, reg_start, current_start, reg_end)
+        cut = d["cut_sec"]
+        is_last = cut >= reg_end - 1e-6
+        end_pad = padding_sec if is_last else _internal_pad(d["pause_sec"], padding_sec)
 
-        # Apply padding to start and end
-        # (Don't pad backwards past 0 or forwards past total audio)
-        padded_start = max(0.0, current_start - padding_sec)
-        padded_end = min(total_audio_sec, cut_point + padding_sec)
-
+        padded_start = max(0.0, current_start - start_pad)
+        padded_end = min(total_audio_sec, cut + end_pad)
         seg_duration = padded_end - padded_start
 
-        # Ensure segment satisfies minimum length
         if seg_duration >= MIN_SEGMENT_DURATION_SEC:
             segments.append({
                 "start_sec": round(padded_start, 3),
@@ -217,14 +255,25 @@ def segment_speech_region(
                 "duration_sec": round(seg_duration, 3),
                 "region_label": region["label"],
                 "confidence_score": region.get("confidence", 1.0),
-                "boundary_method": "energy_trough_v1",
-                "boundary_check": status,
+                "boundary_method": BOUNDARY_METHOD,
+                "boundary_check": d["status"],
+                "cut_energy_db": None if d["cut_energy_db"] is None else round(d["cut_energy_db"], 2),
+                "pause_ms": None if d["pause_sec"] is None else int(round(d["pause_sec"] * 1000)),
+                "pause_depth_db": None if d["pause_depth_db"] is None else round(d["pause_depth_db"], 1),
             })
-
-        # Advance to next segment
-        current_start = cut_point
-
+        current_start = cut
+        start_pad = end_pad            # the next clip starts where this one stopped padding
     return segments
+
+
+# --------------------------------------------------------------------------- #
+# Export
+# --------------------------------------------------------------------------- #
+def _rel(path: Path) -> str:
+    try:
+        return path.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def export_segments(
@@ -232,36 +281,14 @@ def export_segments(
     regions: List[Dict[str, Any]],
     video_id: str,
     output_dir: Optional[Path] = None,
-    max_segments: Optional[int] = None
+    max_segments: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Splits audio into speech segments, exports individual WAV files,
-    and returns a structured manifest list.
-
-    Parameters:
-    -----------
-    wav_path : Path
-        Source 16 kHz mono WAV.
-    regions : List[dict]
-        Classified regions from Stage 4.
-    video_id : str
-        Video identifier for segment naming (e.g. 'gK017cCH36k').
-    output_dir : Path, optional
-        Target directory for segment WAVs (defaults to data/segments/).
-    max_segments : int, optional
-        Limit number of segments exported (useful for fast testing).
-
-    Returns:
-    --------
-    List[dict] : Complete segment records with paths, timestamps, and status.
-    """
+    """Cut the WAV into segment files, save the manifest, return the records."""
     wav_path = Path(wav_path).resolve()
     if not wav_path.exists():
         raise FileNotFoundError(f"Audio file not found: {wav_path}")
 
-    if output_dir is None:
-        output_dir = SEGMENTS_DIR
-    output_dir = Path(output_dir).resolve()
+    output_dir = Path(output_dir).resolve() if output_dir is not None else SEGMENTS_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n[segmenter] Loading audio from {wav_path.name}...")
@@ -269,65 +296,58 @@ def export_segments(
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
 
-    print(f"[segmenter] Segmenting speech regions (target: 8–12s, limits: 5–15s)...")
-
-    # Step 1: Generate segment timestamp definitions
-    all_segment_defs = []
+    print("[segmenter] Segmenting speech regions (pause-based cuts, 5-15 s clips)...")
+    all_defs: List[Dict[str, Any]] = []
     for reg in regions:
         if reg["label"] in ("speech", "mixed"):
-            defs = segment_speech_region(audio, sr, reg)
-            all_segment_defs.extend(defs)
-
+            all_defs.extend(segment_speech_region(audio, sr, reg))
     if max_segments is not None:
-        all_segment_defs = all_segment_defs[:max_segments]
+        all_defs = all_defs[:max_segments]
+    print(f"[segmenter] Identified {len(all_defs)} valid speech segments.")
 
-    print(f"[segmenter] Identified {len(all_segment_defs)} valid speech segments.")
-    print(f"[segmenter] Slicing and exporting individual WAV files...")
+    # Remove clips from a previous run of this video so stale files never reach Stage 6+
+    for stale in output_dir.glob(f"{video_id}_seg_*.wav"):
+        stale.unlink()
 
-    manifest_records = []
-
-    # Step 2: Slice each segment from audio and save to disk
-    for idx, seg_def in enumerate(all_segment_defs, start=1):
+    records: List[Dict[str, Any]] = []
+    for idx, d in enumerate(all_defs, start=1):
         segment_id = f"{video_id}_seg_{idx:06d}"
-        segment_filename = f"{segment_id}.wav"
-        segment_path = output_dir / segment_filename
-
-        # Convert timestamps to exact sample indices
-        start_frame = int(seg_def["start_sec"] * sr)
-        end_frame = int(seg_def["end_sec"] * sr)
-
-        # Slice the audio array
-        clip = audio[start_frame:end_frame]
-
-        # Save as standard 16-bit PCM WAV (subtype='PCM_16')
+        segment_path = output_dir / f"{segment_id}.wav"
+        clip = audio[int(d["start_sec"] * sr):int(d["end_sec"] * sr)]
         sf.write(str(segment_path), clip, sr, subtype="PCM_16")
-
-        # Build the formal manifest record
-        record = {
+        records.append({
             "video_id": video_id,
             "segment_id": segment_id,
-            "audio_path": str(segment_path.relative_to(PROJECT_ROOT)),
-            "start_sec": seg_def["start_sec"],
-            "end_sec": seg_def["end_sec"],
-            "duration_sec": seg_def["duration_sec"],
-            "region_label": seg_def["region_label"],
-            "confidence_score": seg_def["confidence_score"],
-            "boundary_method": seg_def["boundary_method"],
-            "boundary_check": seg_def["boundary_check"],
-        }
-        manifest_records.append(record)
+            "audio_path": _rel(segment_path),
+            "start_sec": d["start_sec"],
+            "end_sec": d["end_sec"],
+            "duration_sec": d["duration_sec"],
+            "region_label": d["region_label"],
+            "confidence_score": d["confidence_score"],
+            "boundary_method": d["boundary_method"],
+            "boundary_check": d["boundary_check"],
+            "cut_energy_db": d.get("cut_energy_db"),
+            "pause_ms": d.get("pause_ms"),
+            "pause_depth_db": d.get("pause_depth_db"),
+        })
 
-    # Step 3: Print summary statistics
-    durations = [r["duration_sec"] for r in manifest_records]
-    avg_dur = np.mean(durations) if durations else 0.0
-    verified_count = sum(1 for r in manifest_records if r["boundary_check"] == "auto_verified")
-    flagged_count = sum(1 for r in manifest_records if r["boundary_check"] == "flagged_manual_review")
+    durations = [r["duration_sec"] for r in records]
+    pauses = [r["pause_ms"] for r in records if r["pause_ms"]]
+    verified = sum(1 for r in records if r["boundary_check"] == "auto_verified")
+    flagged = sum(1 for r in records if r["boundary_check"] == "flagged_manual_review")
+    print("\n[segmenter] Export Complete:")
+    print(f"  • Total Segments: {len(records)}")
+    if durations:
+        print(f"  • Average Duration: {np.mean(durations):.2f}s "
+              f"(Min: {min(durations):.2f}s, Max: {max(durations):.2f}s)")
+    print(f"  • Cuts in a real pause: {verified}   Flagged for review: {flagged}")
+    if pauses:
+        print(f"  • Pause at internal cuts: median {int(np.median(pauses))} ms, min {min(pauses)} ms")
+    print(f"  • Destination: {_rel(output_dir)}/")
 
-    print(f"\n[segmenter] Export Complete:")
-    print(f"  • Total Segments: {len(manifest_records)}")
-    print(f"  • Average Duration: {avg_dur:.2f}s (Min: {min(durations):.2f}s, Max: {max(durations):.2f}s)")
-    print(f"  • Auto-Verified Cuts: {verified_count}")
-    print(f"  • Flagged for Review: {flagged_count}")
-    print(f"  • Destination: {output_dir.relative_to(PROJECT_ROOT)}/")
-
-    return manifest_records
+    manifest_path = PROJECT_ROOT / "metadata" / f"{video_id}_segments.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(records, fh, ensure_ascii=False, indent=2)
+    print(f"  • Manifest: {_rel(manifest_path)}")
+    return records
