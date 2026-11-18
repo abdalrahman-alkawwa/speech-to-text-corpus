@@ -4,13 +4,45 @@ Test suite for Stage 2 audio extraction and validation.
 """
 
 import sys
+import subprocess
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.audio_extractor import check_ffmpeg_available, validate_audio, extract_audio
+
+
+def test_extract_audio_handles_undecodable_ffmpeg_output():
+    print("[TEST] Checking extraction with non-UTF-8 FFmpeg output...")
+    real_run = subprocess.run
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = Path(temp_dir) / "input.mp4"
+        output_path = Path(temp_dir) / "output.wav"
+        input_path.touch()
+
+        def run_with_undecodable_stderr(cmd, **kwargs):
+            return real_run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; os.write(2, bytes([144]))"
+                ],
+                **kwargs
+            )
+
+        with patch("src.audio_extractor.check_ffmpeg_available"), patch(
+            "src.audio_extractor.subprocess.run",
+            side_effect=run_with_undecodable_stderr
+        ):
+            extracted = extract_audio(input_path, output_path)
+
+    assert extracted == output_path.resolve()
+    print("  -> PASSED\n")
 
 
 def test_ffmpeg_available():
@@ -69,6 +101,7 @@ if __name__ == "__main__":
     print("========================================")
     print(" Running Stage 2: Audio Extractor Tests ")
     print("========================================\n")
+    test_extract_audio_handles_undecodable_ffmpeg_output()
     test_ffmpeg_available()
     test_validate_existing_processed_wav()
     test_small_extraction()

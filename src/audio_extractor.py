@@ -178,7 +178,14 @@ def extract_audio(
 
     # Execute the command via subprocess
     # stdout and stderr are captured as text pipes for clean error reporting
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace"
+    )
 
     # If FFmpeg exited with any code other than 0, an error occurred
     if result.returncode != 0:
