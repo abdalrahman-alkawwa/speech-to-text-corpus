@@ -1,0 +1,32 @@
+{
+  "video_id": "local_68f35e9416f7",
+  "source_type": "local_upload",
+  "source_url": null,
+  "original_filename": "هل_يرحل_عموتة_هل_ينجح_بوتشيتنو_مع_اليونايتد_تقييم_M2LCIFaBqZ8.webm",
+  "sha256": "68f35e9416f7c792cd2275c8fcaea2a9f74a5f274ee36b4a0b2cd63238dff939",
+  "title": "هل_يرحل_عموتة_هل_ينجح_بوتشيتنو_مع_اليونايتد_تقييم_M2LCIFaBqZ8",
+  "channel": null,
+  "channel_id": null,
+  "upload_date": null,
+  "duration_seconds": 5009.86,
+  "description": null,
+  "language_reported": "ar",
+  "license_reported": "NA",
+  "notes": "Local file provided for Arabic labelled speech corpus research.",
+  "ingestion_info": {
+    "tool": "local_ingest",
+    "tool_version": null,
+    "ingested_at_utc": "2026-11-20T23:24:02.353568+00:00",
+    "raw_file": "data/raw/هل_يرحل_عموتة_هل_ينجح_بوتشيتنو_مع_اليونايتد_تقييم_M2LCIFaBqZ8.webm",
+    "raw_size_bytes": 64207653
+  },
+  "audio_properties": {
+    "processed_file": "data/processed/هل_يرحل_عموتة_هل_ينجح_بوتشيتنو_مع_اليونايتد_تقييم_local_68f35e9416f7.wav",
+    "sample_rate": 16000,
+    "channels": 1,
+    "subtype": "PCM_16",
+    "format": "WAV",
+    "duration_seconds": 5009.86,
+    "total_frames": 80157696
+  }
+}

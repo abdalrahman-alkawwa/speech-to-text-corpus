@@ -157,26 +157,30 @@ def run_silero_vad_chunked(
     model=None
 ) -> np.ndarray:
     """
-    Run Silero VAD on audio in chunks and map its predictions
-    onto the 50 ms analysis frames using overlap-weighted averaging.
+    Run Silero VAD in chunks and map its 512-sample scores to 50 ms frames.
 
-    Supplying an already-loaded model allows reuse across recordings.
+    Each analysis-frame score is an overlap-weighted average of the VAD
+    windows that actually overlap that frame. This avoids including a VAD
+    window merely because it touches the frame's endpoint.
+
+    `model` is optional. Supplying an already-loaded model allows callers to
+    reuse it across multiple recordings.
     """
     if sr != SAMPLE_RATE:
         raise ValueError(
-            f"Silero VAD expects {SAMPLE_RATE} Hz audio; got {sr} Hz."
+            f"Silero VAD in this pipeline expects {SAMPLE_RATE} Hz audio; got {sr} Hz."
         )
-
     if chunk_duration_sec <= 0:
         raise ValueError("chunk_duration_sec must be greater than zero.")
 
     audio = _validate_audio_array(audio)
 
-    # Align chunk boundaries with analysis-frame boundaries.
-    requested_samples = int(round(chunk_duration_sec * sr))
+    # Align chunk boundaries to the 50 ms analysis-frame grid. This ensures
+    # that an analysis frame is never split across two chunks.
+    requested_chunk_samples = int(round(chunk_duration_sec * sr))
     chunk_samples = max(
         FRAME_SIZE_SAMPLES,
-        (requested_samples // FRAME_SIZE_SAMPLES) * FRAME_SIZE_SAMPLES
+        (requested_chunk_samples // FRAME_SIZE_SAMPLES) * FRAME_SIZE_SAMPLES
     )
 
     total_frames = len(audio) // FRAME_SIZE_SAMPLES
@@ -187,73 +191,7 @@ def run_silero_vad_chunked(
 
     if model is None:
         model = load_vad_model()
-
-    def get_vad_probabilities(chunk: np.ndarray) -> np.ndarray:
-        """Run Silero on all complete 512-sample windows in a chunk."""
-        chunk_tensor = torch.from_numpy(chunk)
-
-        probabilities = []
-
-        for start in range(
-            0,
-            len(chunk_tensor) - VAD_WINDOW_SAMPLES + 1,
-            VAD_WINDOW_SAMPLES
-        ):
-            window = chunk_tensor[start:start + VAD_WINDOW_SAMPLES]
-            probability = model(window, sr).item()
-            probabilities.append(probability)
-
-        return np.asarray(probabilities, dtype=np.float32)
-
-    def map_vad_to_frames(
-        probabilities: np.ndarray,
-        chunk_start: int,
-        chunk_end: int
-    ) -> None:
-        """Map VAD window probabilities onto overlapping analysis frames."""
-        first_frame = chunk_start // FRAME_SIZE_SAMPLES
-        last_frame = min(
-            total_frames,
-            chunk_end // FRAME_SIZE_SAMPLES
-        )
-
-        for frame_index in range(first_frame, last_frame):
-            frame_start = (
-                frame_index * FRAME_SIZE_SAMPLES - chunk_start
-            )
-            frame_end = frame_start + FRAME_SIZE_SAMPLES
-
-            first_window = frame_start // VAD_WINDOW_SAMPLES
-            last_window = (
-                frame_end + VAD_WINDOW_SAMPLES - 1
-            ) // VAD_WINDOW_SAMPLES
-
-            weighted_sum = 0.0
-            covered_samples = 0
-
-            for window_index in range(
-                first_window,
-                min(last_window, len(probabilities))
-            ):
-                window_start = window_index * VAD_WINDOW_SAMPLES
-                window_end = window_start + VAD_WINDOW_SAMPLES
-
-                overlap = max(
-                    0,
-                    min(frame_end, window_end)
-                    - max(frame_start, window_start)
-                )
-
-                if overlap:
-                    weighted_sum += (
-                        float(probabilities[window_index]) * overlap
-                    )
-                    covered_samples += overlap
-
-            if covered_samples:
-                frame_probs[frame_index] = (
-                    weighted_sum / covered_samples
-                )
+#We aren't training Silero. We're just using it to make predictions torch.inference_mode()  disables unnecessary gradient tracking and reduces overhead..
 
     with torch.inference_mode():
         for chunk_start in range(0, len(audio), chunk_samples):
@@ -261,17 +199,71 @@ def run_silero_vad_chunked(
             chunk = audio[chunk_start:chunk_end]
 
             model.reset_states()
+            chunk_tensor = torch.from_numpy(chunk)
 
-            probabilities = get_vad_probabilities(chunk)
+            # Store each complete VAD window's score. A final incomplete
+            # 512-sample tail is ignored by Silero's fixed-window interface.
+            micro_probs = []
+            for local_start in range(
+                0, len(chunk_tensor) - VAD_WINDOW_SAMPLES + 1,
+                VAD_WINDOW_SAMPLES
+            ):
+                window = chunk_tensor[
+                    local_start:local_start + VAD_WINDOW_SAMPLES
+                ]
+                probability = float(model(window, sr).item())
+                micro_probs.append(probability)
 
-            if len(probabilities) == 0:
+            if not micro_probs:
                 continue
 
-            map_vad_to_frames(
-                probabilities,
-                chunk_start,
-                chunk_end
+            micro_probs = np.asarray(micro_probs, dtype=np.float32)
+
+            # The chunk boundaries are frame-aligned, so these are exactly
+            # the analysis frames belonging to this chunk.
+            first_frame = chunk_start // FRAME_SIZE_SAMPLES
+            last_frame = min(
+                total_frames,
+                chunk_end // FRAME_SIZE_SAMPLES
             )
+
+            for frame_index in range(first_frame, last_frame):
+                frame_start = (
+                    frame_index * FRAME_SIZE_SAMPLES - chunk_start
+                )
+                frame_end = frame_start + FRAME_SIZE_SAMPLES
+
+                weighted_probability = 0.0
+                covered_samples = 0
+
+                # Determine which VAD windows can overlap this frame.
+                first_micro = frame_start // VAD_WINDOW_SAMPLES
+                last_micro_exclusive = (
+                    frame_end + VAD_WINDOW_SAMPLES - 1
+                ) // VAD_WINDOW_SAMPLES
+
+                for micro_index in range(
+                    first_micro,
+                    min(last_micro_exclusive, len(micro_probs))
+                ):
+                    micro_start = micro_index * VAD_WINDOW_SAMPLES
+                    micro_end = micro_start + VAD_WINDOW_SAMPLES
+
+                    overlap = max(
+                        0,
+                        min(frame_end, micro_end) - max(frame_start, micro_start)
+                    )
+
+                    if overlap:
+                        weighted_probability += (
+                            float(micro_probs[micro_index]) * overlap
+                        )
+                        covered_samples += overlap
+
+                if covered_samples:
+                    frame_probs[frame_index] = (
+                        weighted_probability / covered_samples
+                    )
 
     return frame_probs
 
