@@ -1,38 +1,3 @@
-"""
-src/segmenter.py  -  Stage 5: Speech Segmentation (v2: pause-based cuts)
-=========================================================================
-
-Turns Stage 4 speech/mixed regions into 5-15 s clips (target 8-12 s) that do not
-start or end in the middle of a word.
-
-What changed from v1 (and why)
-------------------------------
-v1 cut at the single quietest 50 ms frame and then added 0.15 s of padding on
-BOTH sides of EVERY cut.  That is right for the outer edges of a region (silence
-follows) but wrong for a cut through continuous speech: when the pause at the
-cut is shorter than 0.3 s, each clip's padding reaches into the neighbouring
-word, so a clip ends with the first syllable of the next word and the next clip
-starts with the tail of the previous one.  v1 also judged "is this a clean cut?"
-with a fixed -28 dBFS, which says nothing about how loud THIS recording is.
-
-v2:
- 1. Finds real PAUSES: runs of 20 ms frames that are at least PAUSE_DEPTH_DB below
-    the local speech level and last at least MIN_PAUSE_SEC.  Closures inside words
-    (stops such as b/t/k) are shorter than that and are ignored.
- 2. Cuts at the CENTRE of the longest such pause in the 8-12 s window; if none,
-    it widens the window to 6-14 s; if still none it falls back to the smoothed
-    energy minimum and flags the cut for manual review.
- 3. At an internal cut, padding is limited to 40 % of the pause length (so it stays
-    inside the pause).  The full 0.15 s cushion is kept only at the outer edges of a
-    region.
- 4. "auto_verified" now means "cut sits in a real pause"; each segment also records
-    pause_ms and pause_depth_db so you can audit it.
-
-Public names kept from v1: find_best_cut_point (2-tuple), find_best_cut_point_with_energy
-(3-tuple), segment_speech_region, export_segments (same signature and record fields,
-plus cut_energy_db, pause_ms, pause_depth_db).  boundary_method is now "energy_pause_v2".
-"""
-
 import sys
 from pathlib import Path
 

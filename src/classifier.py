@@ -3,152 +3,124 @@ src/classifier.py
 ==================
 Stage 4: Region Classification (Speech / Music / Silence / Mixed)
 
-Purpose:
---------
-Classifies every second of a 16 kHz WAV file into one of four categories:
-  1. speech  — Human voice is the dominant signal.
-  2. silence — No meaningful audio activity (pauses, dead air, room tone).
-  3. music   — Tonal/harmonic content without human voice (intros, jingles).
-  4. mixed   — Speech overlapping with music or heavy background noise.
+This module classifies a 16 kHz WAV recording into frame-level labels and
+merges those labels into time regions.
 
-Method:
--------
-We combine two independent evidence signals to make the classification:
-
-  Signal A — Short-Time RMS Energy:
-    Measures how loud each frame is. Very low energy → silence candidate.
-    But low energy alone cannot distinguish quiet speech from true silence.
-
-  Signal B — Silero VAD (Voice Activity Detection):
-    A pre-trained neural network that outputs a speech probability (0.0–1.0)
-    for each audio window. It IS trained to detect human voice specifically,
-    so it can tell quiet speech from background hum.
-
-Decision Fusion Table:
-    | RMS Energy  | VAD Speech Prob  | → Label   |
-    |-------------|------------------|-----------|
-    | Low         | Low  (< 0.3)     | silence   |
-    | Low         | High (≥ 0.5)     | speech    |  ← quiet talker, NOT silence
-    | Normal/High | High (≥ 0.5)     | speech    |
-    | Normal/High | Low  (< 0.3)     | music     |  ← energy but no voice
-    | Any         | Mid  (0.3–0.5)   | mixed     |  ← uncertain region
-
-Important Limitations (documented per assignment requirements):
-  - VAD is NOT a complete 4-class classifier; it only detects voice presence.
-  - The confidence score is a heuristic measure, NOT a calibrated probability.
-  - Spectral flatness is computed but does NOT influence the labels (it read ~0.012
-    for both speech and silence on lecture audio); music is inferred from loud frames
-    with low VAD probability, which is imperfect.
-  - All automatic labels are suggestions; human correction is expected in Stage 10.
+Important limitations:
+- Silero VAD detects voice activity; it is not a four-class classifier.
+- "music" means energetic audio with low VAD confidence. Sound effects and
+  noise can receive this label too.
+- "mixed" means uncertain VAD output (0.3 <= score < 0.5); it does not
+  prove that speech and music overlap.
+- Confidence values are heuristic, not calibrated probabilities.
+- Automatic labels are suggestions and should be reviewed by an annotator.
 """
 
 import sys
 import os
+import json
+import warnings
 from pathlib import Path
+from typing import List, Dict, Any, Optional
 
-# Ensure project root is in sys.path
+# Ensure project root is in sys.path.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-import json
-import warnings
-from typing import List, Dict, Any, Optional
 
 import numpy as np
 import soundfile as sf
 import torch
 
-# Suppress the FutureWarning from torch.jit.load inside Silero VAD
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.jit")
 import silero_vad
 
 
-# --- Windows NVIDIA DLL Fix ---
-# On Windows, PyTorch's CUDA libraries installed via pip into .venv need their
-# DLL directories registered explicitly so that ctranslate2 / torch can find them.
+# --- Windows NVIDIA DLL setup ---
+# Register NVIDIA DLL folders when they exist. This is harmless on CPU-only
+# installations and can help PyTorch locate its bundled CUDA libraries.
 if sys.platform == "win32":
     try:
         import site
-        nvidia_dir = Path(site.getsitepackages()[-1]) / "nvidia"
-        if nvidia_dir.exists():
-            for bin_dir in nvidia_dir.glob("*/bin"):
-                os.add_dll_directory(str(bin_dir))
-    except Exception:
+
+        site_packages = site.getsitepackages()
+        if site_packages:
+            nvidia_dir = Path(site_packages[-1]) / "nvidia"
+            if nvidia_dir.exists():
+                for bin_dir in nvidia_dir.glob("*/bin"):
+                    os.add_dll_directory(str(bin_dir))
+    except (OSError, AttributeError, IndexError):
         pass
 
 
 # ============================================================
-#  CONFIGURATION — All thresholds in one place for easy tuning
+# Configuration
 # ============================================================
 
-# Frame size for energy analysis: 50 ms = 800 samples at 16 kHz
-FRAME_SIZE_SAMPLES = 800
+SAMPLE_RATE = 16000
+FRAME_SIZE_SAMPLES = 800             # 50 ms at 16 kHz
+VAD_WINDOW_SAMPLES = 512             # 32 ms at 16 kHz
 
-# RMS energy threshold (in dBFS, i.e. relative to full scale) to consider a frame as "low energy"
-# In classroom/lecture recordings, background room tone (AC, projector fan) sits around -33 to -36 dB,
-# while active speech sits around -20 to -26 dB.
-# Setting this threshold to -31.0 dB correctly identifies ambient room tone as silence.
 SILENCE_THRESHOLD_DB = -31.0
+VAD_SPEECH_THRESHOLD = 0.5
+VAD_UNCERTAIN_LOW = 0.3
 
-# Silero VAD thresholds for speech probability
-VAD_SPEECH_THRESHOLD = 0.5     # Above this → strong speech evidence
-VAD_UNCERTAIN_LOW = 0.3        # Below this → no speech evidence
-# Between 0.3 and 0.5 → uncertain (mixed)
-
-# Minimum region duration in seconds — regions shorter than this get merged
-# into their neighbors to prevent millisecond-level jitter
-# Set to 1.5s because natural speech pauses (0.3–1.2s) between sentences
-# cause brief VAD dropouts that would be falsely labeled as "music"
+# Keep this fairly small so short pauses remain visible to the annotator.
+# This is a cleanup setting, not the final 5–15 second ASR segmentation rule.
 MIN_REGION_DURATION_SEC = 1.5
 
 
 def load_vad_model():
+    """Load the lightweight Silero Voice Activity Detection model."""
+    return silero_vad.load_silero_vad()
+
+
+def _validate_audio_array(audio: np.ndarray) -> np.ndarray:
+    """Validate and normalize an audio array to one-dimensional float32."""
+    audio = np.asarray(audio, dtype=np.float32)
+
+    if audio.ndim == 2:
+        # soundfile returns stereo as (samples, channels).
+        audio = np.mean(audio, axis=1)
+    elif audio.ndim != 1:
+        raise ValueError(
+            f"Expected mono or stereo audio, received array with shape {audio.shape}."
+        )
+
+    if audio.size == 0:
+        raise ValueError("Audio file contains no samples.")
+
+    if not np.all(np.isfinite(audio)):
+        raise ValueError("Audio contains NaN or infinite sample values.")
+
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def compute_frame_energy_db(
+    audio: np.ndarray,
+    frame_size: int = FRAME_SIZE_SAMPLES
+) -> np.ndarray:
     """
-    Loads the pre-installed Silero VAD model.
-    This is a lightweight (~2 MB) neural network that runs on CPU.
-    It returns speech probability for each audio window.
+    Compute RMS energy in dBFS for non-overlapping frames.
+
+    RMS = sqrt(mean(samples ** 2))
+    dBFS = 20 * log10(RMS)
+
+    Only complete frames are included. Any trailing samples shorter than one
+    frame are ignored consistently by the frame-based classifier.
     """
-    model = silero_vad.load_silero_vad()
-    return model
+    if frame_size <= 0:
+        raise ValueError("frame_size must be greater than zero.")
 
-
-def compute_frame_energy_db(audio: np.ndarray, frame_size: int = FRAME_SIZE_SAMPLES) -> np.ndarray:
-    """
-    Computes RMS energy in decibels for non-overlapping frames.
-
-    RMS (Root Mean Square) measures the average loudness of a frame:
-      RMS = sqrt( (1/N) * sum(x[i]^2) )
-
-    We convert to decibels relative to full scale (1.0 = 0 dBFS):
-      dB = 20 * log10(RMS)
-
-    Parameters:
-    -----------
-    audio : np.ndarray
-        1D audio array (normalized float32, values between -1.0 and 1.0).
-    frame_size : int
-        Number of samples per analysis frame (800 = 50 ms at 16 kHz).
-
-    Returns:
-    --------
-    np.ndarray : 1D array of energy values in dB, one per frame.
-    """
-    # Calculate how many complete frames fit in the audio
     num_frames = len(audio) // frame_size
+    if num_frames == 0:
+        return np.empty(0, dtype=np.float32)
 
-    # Truncate audio to exact multiple of frame_size, then reshape into a 2D matrix
-    # where each row is one frame of 800 samples
     frames = audio[:num_frames * frame_size].reshape(num_frames, frame_size)
-
-    # Compute RMS for each frame (axis=1 means across each row)
     rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    energy_db = 20.0 * np.log10(np.maximum(rms, 1e-10))
 
-    # Convert to decibels; clip minimum to avoid log(0) = -infinity
-    eps = 1e-10
-    energy_db = 20.0 * np.log10(np.maximum(rms, eps))
-
-    return energy_db
+    return energy_db.astype(np.float32)
 
 
 def compute_frame_spectral_flatness(
@@ -156,132 +128,150 @@ def compute_frame_spectral_flatness(
     frame_size: int = FRAME_SIZE_SAMPLES
 ) -> np.ndarray:
     """
-    Computes the Spectral Flatness Measure (SFM / Wiener Entropy) for each frame.
+    Compute spectral flatness for diagnostics.
 
-    Mathematical Definition:
-      SFM = Geometric_Mean(Power_Spectrum) / Arithmetic_Mean(Power_Spectrum)
-
-    Physical Interpretation:
-      - SFM near 1.0 (Flat Spectrum): Energy is distributed evenly across all
-        frequencies. This is characteristic of broadband noise (fan hum, air conditioning,
-        room tone, whisper hiss).
-      - SFM near 0.0 (Spiky/Tonal Spectrum): Energy is concentrated in discrete harmonic
-        peaks. This is characteristic of musical instruments, melodies, and chords.
-
-    NOTE: currently computed for diagnostics only; classify_frames() does not use it.
     """
+    if frame_size <= 0:
+        raise ValueError("frame_size must be greater than zero.")
+
     num_frames = len(audio) // frame_size
+    if num_frames == 0:
+        return np.empty(0, dtype=np.float32)
+
     frames = audio[:num_frames * frame_size].reshape(num_frames, frame_size)
-
-    # Apply Hann window to each frame to minimize edge boundary artifacts
-    window = np.hanning(frame_size)
-    windowed_frames = frames * window
-
-    # Compute Real FFT power spectrum: |FFT(x)|^2
+    windowed_frames = frames * np.hanning(frame_size)
     power_spectrum = np.abs(np.fft.rfft(windowed_frames, axis=1)) ** 2
+    power_spectrum = np.maximum(power_spectrum, 1e-10)
 
-    # Prevent log(0) with epsilon
-    eps = 1e-10
-    power_spectrum = np.maximum(power_spectrum, eps)
+    geometric_mean = np.exp(np.mean(np.log(power_spectrum), axis=1))
+    arithmetic_mean = np.mean(power_spectrum, axis=1)
+    flatness = geometric_mean / (arithmetic_mean + 1e-10)
 
-    # Geometric Mean = exp( mean( ln(P) ) )
-    log_power = np.log(power_spectrum)
-    geom_mean = np.exp(np.mean(log_power, axis=1))
-
-    # Arithmetic Mean
-    arith_mean = np.mean(power_spectrum, axis=1)
-
-    # Flatness ratio
-    flatness = geom_mean / (arith_mean + eps)
-    return np.clip(flatness, 0.0, 1.0)
+    return np.clip(flatness, 0.0, 1.0).astype(np.float32)
 
 
 def run_silero_vad_chunked(
     audio: np.ndarray,
-    sr: int = 16000,
-    chunk_duration_sec: float = 30.0
+    sr: int = SAMPLE_RATE,
+    chunk_duration_sec: float = 30.0,
+    model=None
 ) -> np.ndarray:
     """
-    Runs Silero VAD on audio in chunks, returning per-frame (50 ms) speech probabilities.
+    Run Silero VAD on audio in chunks and map its predictions
+    onto the 50 ms analysis frames using overlap-weighted averaging.
 
-    Why chunked processing:
-    -----------------------
-    Silero VAD's internal model uses a recurrent neural network (RNN). Processing
-    the entire 95-minute file in one call could hit memory limits. We process in
-    30-second chunks and reset the model state between chunks.
-
-    The VAD model internally works with 512-sample windows (32 ms at 16 kHz).
-    We average those micro-probabilities into our 50 ms analysis frames.
-
-    Parameters:
-    -----------
-    audio : np.ndarray
-        Full audio array (float32, 16 kHz, mono).
-    sr : int
-        Sample rate (must be 16000).
-    chunk_duration_sec : float
-        Duration of each processing chunk in seconds.
-
-    Returns:
-    --------
-    np.ndarray : Speech probability (0.0 to 1.0) for each 50 ms frame.
+    Supplying an already-loaded model allows reuse across recordings.
     """
-    model = load_vad_model()
+    if sr != SAMPLE_RATE:
+        raise ValueError(
+            f"Silero VAD expects {SAMPLE_RATE} Hz audio; got {sr} Hz."
+        )
 
-    # Silero VAD window size for 16 kHz audio
-    vad_window = 512  # 32 ms per micro-frame
+    if chunk_duration_sec <= 0:
+        raise ValueError("chunk_duration_sec must be greater than zero.")
 
-    chunk_samples = int(chunk_duration_sec * sr)
+    audio = _validate_audio_array(audio)
+
+    # Align chunk boundaries with analysis-frame boundaries.
+    requested_samples = int(round(chunk_duration_sec * sr))
+    chunk_samples = max(
+        FRAME_SIZE_SAMPLES,
+        (requested_samples // FRAME_SIZE_SAMPLES) * FRAME_SIZE_SAMPLES
+    )
+
     total_frames = len(audio) // FRAME_SIZE_SAMPLES
     frame_probs = np.zeros(total_frames, dtype=np.float32)
 
-    # Process audio in chunks
-    for chunk_start in range(0, len(audio), chunk_samples):
-        chunk_end = min(chunk_start + chunk_samples, len(audio))
-        chunk = audio[chunk_start:chunk_end]
+    if total_frames == 0:
+        return frame_probs
 
-        # Reset the model's internal RNN state for each new chunk
-        model.reset_states()
+    if model is None:
+        model = load_vad_model()
 
-        # Convert chunk to a PyTorch tensor (Silero expects torch.Tensor)
-        chunk_tensor = torch.from_numpy(chunk).float()
+    def get_vad_probabilities(chunk: np.ndarray) -> np.ndarray:
+        """Run Silero on all complete 512-sample windows in a chunk."""
+        chunk_tensor = torch.from_numpy(chunk)
 
-        # Collect micro-frame probabilities within this chunk
-        micro_probs = []
-        for i in range(0, len(chunk_tensor) - vad_window + 1, vad_window):
-            window = chunk_tensor[i:i + vad_window]
-            if len(window) == vad_window:
-                # Run model on one micro-window → returns speech probability scalar
-                prob = model(window, sr).item()
-                micro_probs.append(prob)
+        probabilities = []
 
-        if not micro_probs:
-            continue
+        for start in range(
+            0,
+            len(chunk_tensor) - VAD_WINDOW_SAMPLES + 1,
+            VAD_WINDOW_SAMPLES
+        ):
+            window = chunk_tensor[start:start + VAD_WINDOW_SAMPLES]
+            probability = model(window, sr).item()
+            probabilities.append(probability)
 
-        # Map micro-probabilities (32 ms each) to our analysis frames (50 ms each)
-        micro_probs_arr = np.array(micro_probs)
-        micro_duration = vad_window / sr                       # 0.032 seconds
-        frame_duration = FRAME_SIZE_SAMPLES / sr               # 0.050 seconds
+        return np.asarray(probabilities, dtype=np.float32)
 
-        for fi in range(chunk_start // FRAME_SIZE_SAMPLES,
-                        min(total_frames, -(-chunk_end // FRAME_SIZE_SAMPLES))):
-            # Calculate the global sample range for this analysis frame
-            frame_global_start = fi * FRAME_SIZE_SAMPLES
-            frame_global_end = frame_global_start + FRAME_SIZE_SAMPLES
+    def map_vad_to_frames(
+        probabilities: np.ndarray,
+        chunk_start: int,
+        chunk_end: int
+    ) -> None:
+        """Map VAD window probabilities onto overlapping analysis frames."""
+        first_frame = chunk_start // FRAME_SIZE_SAMPLES
+        last_frame = min(
+            total_frames,
+            chunk_end // FRAME_SIZE_SAMPLES
+        )
 
-            # Check if this frame falls within the current chunk
-            if frame_global_start < chunk_start or frame_global_start >= chunk_end:
+        for frame_index in range(first_frame, last_frame):
+            frame_start = (
+                frame_index * FRAME_SIZE_SAMPLES - chunk_start
+            )
+            frame_end = frame_start + FRAME_SIZE_SAMPLES
+
+            first_window = frame_start // VAD_WINDOW_SAMPLES
+            last_window = (
+                frame_end + VAD_WINDOW_SAMPLES - 1
+            ) // VAD_WINDOW_SAMPLES
+
+            weighted_sum = 0.0
+            covered_samples = 0
+
+            for window_index in range(
+                first_window,
+                min(last_window, len(probabilities))
+            ):
+                window_start = window_index * VAD_WINDOW_SAMPLES
+                window_end = window_start + VAD_WINDOW_SAMPLES
+
+                overlap = max(
+                    0,
+                    min(frame_end, window_end)
+                    - max(frame_start, window_start)
+                )
+
+                if overlap:
+                    weighted_sum += (
+                        float(probabilities[window_index]) * overlap
+                    )
+                    covered_samples += overlap
+
+            if covered_samples:
+                frame_probs[frame_index] = (
+                    weighted_sum / covered_samples
+                )
+
+    with torch.inference_mode():
+        for chunk_start in range(0, len(audio), chunk_samples):
+            chunk_end = min(chunk_start + chunk_samples, len(audio))
+            chunk = audio[chunk_start:chunk_end]
+
+            model.reset_states()
+
+            probabilities = get_vad_probabilities(chunk)
+
+            if len(probabilities) == 0:
                 continue
 
-            # Map to micro-frame indices within this chunk
-            local_start = frame_global_start - chunk_start
-            micro_idx_start = int(local_start / vad_window)
-            micro_idx_end = int((local_start + FRAME_SIZE_SAMPLES) / vad_window) + 1
-            micro_idx_end = min(micro_idx_end, len(micro_probs_arr))
-
-            if micro_idx_start < len(micro_probs_arr):
-                # Average micro-probabilities that overlap with this analysis frame
-                frame_probs[fi] = np.mean(micro_probs_arr[micro_idx_start:micro_idx_end])
+            map_vad_to_frames(
+                probabilities,
+                chunk_start,
+                chunk_end
+            )
 
     return frame_probs
 
@@ -292,166 +282,186 @@ def classify_frames(
     spectral_flatness: Optional[np.ndarray] = None
 ) -> List[Dict[str, Any]]:
     """
-    Applies the decision fusion table to classify each 50 ms frame.
+    Fuse frame energy and VAD scores into speech/silence/music/mixed labels.
 
-    For each frame, it combines:
-      - Energy level (from compute_frame_energy_db)
-      - VAD speech probability (from run_silero_vad_chunked)
-      - Spectral Flatness Measure (accepted but NOT used by the current decision rules)
-
-    And assigns one of: 'speech', 'silence', 'music', or 'mixed'.
-
-    Parameters:
-    -----------
-    energy_db : np.ndarray
-        Per-frame energy in dB.
-    vad_probs : np.ndarray
-        Per-frame speech probability from Silero VAD.
-    spectral_flatness : np.ndarray, optional
-        Per-frame Wiener entropy (0.0 to 1.0).
-
-    Returns:
-    --------
-    List[dict] : One dict per frame with keys: frame_index, label, confidence.
+    `spectral_flatness` is retained as an optional argument for compatibility
+    with existing callers, but it is diagnostic only and does not determine
+    how many frames are classified or affect the labels.
     """
-    num_frames = min(len(energy_db), len(vad_probs))
-    if spectral_flatness is not None:
-        num_frames = min(num_frames, len(spectral_flatness))
+    if len(energy_db) != len(vad_probs):
+        raise ValueError(
+            "energy_db and vad_probs must contain the same number of frames "
+            f"(got {len(energy_db)} and {len(vad_probs)})."
+        )
 
     frame_labels = []
 
-    for i in range(num_frames):
-        e = energy_db[i]
-        v = vad_probs[i]
+    for i, (energy, vad_probability) in enumerate(zip(energy_db, vad_probs)):
+        energy = float(energy)
+        vad_probability = float(vad_probability)
+        low_energy = energy < SILENCE_THRESHOLD_DB
 
-        low_energy = e < SILENCE_THRESHOLD_DB
-
-        # Decision fusion logic:
-        if v >= VAD_SPEECH_THRESHOLD:
-            # Strong voice activity detected → speech
+        if vad_probability >= VAD_SPEECH_THRESHOLD:
             label = "speech"
-            confidence = float(v)
+            confidence = vad_probability
 
-        elif v >= VAD_UNCERTAIN_LOW:
-            # Voice probability is ambiguous (0.3 to 0.5) → mixed / overlapping sound
+        elif vad_probability >= VAD_UNCERTAIN_LOW:
             label = "mixed"
-            confidence = float(0.5 - abs(v - 0.4) * 2)
+            confidence = 0.5 - abs(vad_probability - 0.4) * 2
+
+        elif low_energy:
+            label = "silence"
+            confidence = min(
+                1.0,
+                (1.0 - vad_probability) * 0.5
+                + (abs(energy) / 80.0) * 0.5
+            )
 
         else:
-            # No voice detected (v < 0.3)
-            # Compare loudness against calibrated ambient room tone threshold (-31 dB)
-            if low_energy:
-                label = "silence"
-                confidence = min(1.0, (1.0 - v) * 0.5 + (abs(e) / 80.0) * 0.5)
-            else:
-                # Loud non-vocal audio (intro music, sound effects, loud music track)
-                label = "music"
-                confidence = min(1.0, (1.0 - v) * 0.7)
+            label = "music"
+            confidence = min(1.0, (1.0 - vad_probability) * 0.7)
 
         frame_labels.append({
             "frame_index": i,
             "label": label,
-            "confidence": round(max(0.05, min(1.0, confidence)), 3)
+            "confidence": round(
+                max(0.05, min(1.0, confidence)), 3
+            )
         })
 
     return frame_labels
 
 
+def _merge_two_regions(
+    left: Dict[str, Any],
+    right: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge adjacent regions and calculate duration-weighted confidence."""
+    left_duration = left["end_sec"] - left["start_sec"]
+    right_duration = right["end_sec"] - right["start_sec"]
+    total_duration = left_duration + right_duration
+
+    if total_duration > 0:
+        confidence = (
+            left["confidence"] * left_duration
+            + right["confidence"] * right_duration
+        ) / total_duration
+    else:
+        confidence = left["confidence"]
+
+    return {
+        "start_sec": left["start_sec"],
+        "end_sec": right["end_sec"],
+        "label": left["label"],
+        "confidence": round(float(confidence), 3)
+    }
+
+
 def merge_frames_into_regions(
     frame_labels: List[Dict[str, Any]],
-    sr: int = 16000,
+    sr: int = SAMPLE_RATE,
     frame_size: int = FRAME_SIZE_SAMPLES,
     min_duration: float = MIN_REGION_DURATION_SEC
 ) -> List[Dict[str, Any]]:
     """
-    Merges consecutive frames with the same label into continuous time regions.
+    Merge consecutive frame labels into timestamped regions.
 
-    Why merging is necessary:
-    -------------------------
-    Without merging, we would have thousands of tiny 50 ms micro-labels.
-    An annotator needs to see "speech from 3.5s to 125.8s", not 2,445 individual
-    frame records. Merging also filters out brief (<0.5s) jitter labels that
-    flicker between speech and silence due to natural speech micro-pauses.
-
-    Parameters:
-    -----------
-    frame_labels : list of dict
-        Output from classify_frames().
-    sr : int
-        Sample rate (16000).
-    frame_size : int
-        Samples per frame (800 = 50 ms).
-    min_duration : float
-        Minimum region duration in seconds. Regions shorter than this are
-        absorbed into their preceding neighbor.
-
-    Returns:
-    --------
-    List[dict] : Merged regions with start_sec, end_sec, label, confidence, method.
+    Regions shorter than `min_duration` are absorbed into a neighboring
+    region. A short first region is absorbed forward; later short regions are
+    absorbed backward. This is only light smoothing: it is not the separate
+    5–15 second segmentation stage required for ASR.
     """
+    if sr <= 0 or frame_size <= 0:
+        raise ValueError("sr and frame_size must be greater than zero.")
+    if min_duration < 0:
+        raise ValueError("min_duration cannot be negative.")
     if not frame_labels:
         return []
 
-    frame_duration_sec = frame_size / sr  # 0.05 seconds per frame
+    frame_duration = frame_size / sr
 
-    # Step 1: Group consecutive same-label frames into raw regions
+    # First, group consecutive frames that have the same label.
     raw_regions = []
     current_label = frame_labels[0]["label"]
-    current_start_frame = 0
-    confidence_values = [frame_labels[0]["confidence"]]
+    current_start = 0
+    confidence_values = [float(frame_labels[0]["confidence"])]
 
     for i in range(1, len(frame_labels)):
-        if frame_labels[i]["label"] != current_label:
-            # Label changed — finalize the current region
-            raw_regions.append({
-                "start_sec": round(current_start_frame * frame_duration_sec, 3),
-                "end_sec": round(i * frame_duration_sec, 3),
-                "label": current_label,
-                "confidence": round(float(np.mean(confidence_values)), 3),
-            })
-            # Start a new region
-            current_label = frame_labels[i]["label"]
-            current_start_frame = i
-            confidence_values = [frame_labels[i]["confidence"]]
-        else:
-            confidence_values.append(frame_labels[i]["confidence"])
+        label = frame_labels[i]["label"]
 
-    # Finalize the last region
+        if label != current_label:
+            raw_regions.append({
+                "start_sec": round(current_start * frame_duration, 3),
+                "end_sec": round(i * frame_duration, 3),
+                "label": current_label,
+                "confidence": round(float(np.mean(confidence_values)), 3)
+            })
+            current_label = label
+            current_start = i
+            confidence_values = [float(frame_labels[i]["confidence"])]
+        else:
+            confidence_values.append(float(frame_labels[i]["confidence"]))
+
     raw_regions.append({
-        "start_sec": round(current_start_frame * frame_duration_sec, 3),
-        "end_sec": round(len(frame_labels) * frame_duration_sec, 3),
+        "start_sec": round(current_start * frame_duration, 3),
+        "end_sec": round(len(frame_labels) * frame_duration, 3),
         "label": current_label,
-        "confidence": round(float(np.mean(confidence_values)), 3),
+        "confidence": round(float(np.mean(confidence_values)), 3)
     })
 
-    # Step 2: Remove very short regions by absorbing them into their predecessor
-    # This prevents millisecond-level jitter (e.g., a 0.1s "silence" blip in the
-    # middle of continuous speech caused by a brief mouth-close pause)
-    merged = [raw_regions[0]]
-    for region in raw_regions[1:]:
-        duration = region["end_sec"] - region["start_sec"]
-        if duration < min_duration:
-            # Absorb this tiny region into the previous one by extending its end time
-            merged[-1]["end_sec"] = region["end_sec"]
-        else:
-            merged.append(region)
+    if min_duration == 0 or len(raw_regions) == 1:
+        final_regions = raw_regions
+    else:
+        # Repeatedly absorb short regions until all remaining regions meet
+        # the duration threshold, or only one region remains.
+        regions = [dict(region) for region in raw_regions]
 
-    # Step 3: Second merge pass to fuse any adjacent regions sharing the same label
-    final_regions = [merged[0]]
-    for r in merged[1:]:
-        if r["label"] == final_regions[-1]["label"]:
-            final_regions[-1]["end_sec"] = r["end_sec"]
-            final_regions[-1]["confidence"] = round(
-                (final_regions[-1]["confidence"] + r["confidence"]) / 2.0, 3
-            )
-        else:
-            final_regions.append(r)
+        index = 0
+        while index < len(regions) and len(regions) > 1:
+            duration = regions[index]["end_sec"] - regions[index]["start_sec"]
 
-    # Step 4: Add the classification method identifier to every region
+            if duration >= min_duration:
+                index += 1
+                continue
+
+            if index == 0:
+                # No preceding region exists: merge the first region forward.
+                left = regions[0]
+                right = regions[1]
+                merged = _merge_two_regions(
+                    {**left, "label": right["label"]},
+                    right
+                )
+                # Preserve the right region's label while spanning both.
+                merged["label"] = right["label"]
+                regions[1] = merged
+                del regions[0]
+                index = 0
+            else:
+                # Merge this short region backward, preserving the preceding
+                # region's label.
+                left = regions[index - 1]
+                right = regions[index]
+                merged = _merge_two_regions(left, right)
+                merged["label"] = left["label"]
+                regions[index - 1] = merged
+                del regions[index]
+                index = max(0, index - 1)
+
+        final_regions = regions
+
+    # Adjacent regions can now share a label after short-region absorption.
+    compacted = []
     for region in final_regions:
-        region["method"] = "energy_vad_spectral_v1"
+        if compacted and compacted[-1]["label"] == region["label"]:
+            compacted[-1] = _merge_two_regions(compacted[-1], region)
+        else:
+            compacted.append(region.copy())
 
-    return final_regions
+    for region in compacted:
+        region["method"] = "energy_vad_v2"
+
+    return compacted
 
 
 def classify_audio(
@@ -459,91 +469,114 @@ def classify_audio(
     output_path: Optional[Path] = None
 ) -> List[Dict[str, Any]]:
     """
-    Main entry point: Classifies an entire audio file into speech/silence/music/mixed regions.
+    Classify a 16 kHz WAV file and save its regions as JSON.
 
-    Pipeline:
-      1. Loads audio from disk.
-      2. Computes per-frame RMS energy (Signal A).
-      3. Runs Silero VAD for per-frame speech probability (Signal B).
-      4. Applies decision fusion to label each frame.
-      5. Merges consecutive same-label frames into continuous regions.
-      6. Saves results to JSON.
-
-    Parameters:
-    -----------
-    wav_path : Path
-        Path to the 16 kHz mono PCM_16 WAV file.
-    output_path : Path, optional
-        Where to save the JSON results. Defaults to data/processed/<stem>_regions.json.
-
-    Returns:
-    --------
-    List[dict] : The classified regions.
+    Stereo input is downmixed to mono. Files with any other sample rate are
+    rejected rather than silently being analyzed with incorrect timing/VAD
+    assumptions.
     """
     wav_path = Path(wav_path).resolve()
     if not wav_path.exists():
         raise FileNotFoundError(f"Audio file not found: {wav_path}")
+    if not wav_path.is_file():
+        raise ValueError(f"Audio path is not a file: {wav_path}")
 
     print(f"\n[classifier] Starting region classification for: {wav_path.name}")
-
-    # Step 1: Load the full audio file as float32
     print("[classifier] Loading audio...")
-    audio, sr = sf.read(str(wav_path), dtype="float32")
-    if audio.ndim > 1:
-        audio = np.mean(audio, axis=1)
-    total_duration = len(audio) / sr
-    print(f"[classifier] Loaded {total_duration:.1f}s of audio ({len(audio)} samples at {sr} Hz)")
 
-    # Step 2: Compute per-frame RMS energy and Spectral Flatness
-    print("[classifier] Computing frame-level RMS energy and Spectral Flatness...")
+    audio, sr = sf.read(str(wav_path), dtype="float32")
+
+    if sr != SAMPLE_RATE:
+        raise ValueError(
+            f"Expected a {SAMPLE_RATE} Hz WAV file, but '{wav_path.name}' "
+            f"has a sample rate of {sr} Hz. Resample it before classification."
+        )
+
+    audio = _validate_audio_array(audio)
+    total_duration = len(audio) / sr
+
+    print(
+        f"[classifier] Loaded {total_duration:.1f}s of audio "
+        f"({len(audio)} samples at {sr} Hz, mono)"
+    )
+
+    # Compute frame-level acoustic features.
+    print("[classifier] Computing frame-level RMS energy and spectral flatness...")
     energy_db = compute_frame_energy_db(audio)
     flatness = compute_frame_spectral_flatness(audio)
-    print(f"[classifier] Acoustic features computed for {len(energy_db)} frames (50 ms each)")
+    print(
+        f"[classifier] Acoustic features computed for "
+        f"{len(energy_db)} frames (50 ms each)"
+    )
+    if len(flatness) != len(energy_db):
+        raise RuntimeError("Energy and spectral-flatness frame counts do not match.")
 
-    # Step 3: Run Silero VAD for speech probabilities
+    # Run voice activity detection.
     print("[classifier] Running Silero VAD (this may take a minute for long files)...")
     vad_probs = run_silero_vad_chunked(audio, sr=sr)
     print(f"[classifier] VAD completed for {len(vad_probs)} frames")
 
-    # Step 4: Apply decision fusion
+    # Fuse the two signals into frame labels.
     print("[classifier] Applying classification decision rules...")
-    frame_labels = classify_frames(energy_db, vad_probs, spectral_flatness=flatness)
+    frame_labels = classify_frames(
+        energy_db,
+        vad_probs,
+        spectral_flatness=flatness
+    )
 
-    # Step 5: Merge frames into continuous regions
+    # Merge frame labels into continuous regions.
     regions = merge_frames_into_regions(frame_labels, sr=sr)
 
-    # Step 6: Print summary statistics
+    # Print a summary.
     label_counts = {}
     label_durations = {}
-    for r in regions:
-        dur = r["end_sec"] - r["start_sec"]
-        label_counts[r["label"]] = label_counts.get(r["label"], 0) + 1
-        label_durations[r["label"]] = label_durations.get(r["label"], 0.0) + dur
 
-    print(f"\n[classifier] Classification Summary ({len(regions)} regions, {total_duration:.1f}s total):")
+    for region in regions:
+        duration = region["end_sec"] - region["start_sec"]
+        label = region["label"]
+        label_counts[label] = label_counts.get(label, 0) + 1
+        label_durations[label] = label_durations.get(label, 0.0) + duration
+
+    classified_duration = (
+        len(frame_labels) * FRAME_SIZE_SAMPLES / sr
+    )
+
+    print(
+        f"\n[classifier] Classification Summary "
+        f"({len(regions)} regions, {classified_duration:.1f}s classified):"
+    )
     print(f"  {'Label':<10} {'Count':>6} {'Duration':>10} {'Percentage':>10}")
-    print(f"  {'-'*10} {'-'*6} {'-'*10} {'-'*10}")
+    print(f"  {'-' * 10} {'-' * 6} {'-' * 10} {'-' * 10}")
+
     for label in ["speech", "silence", "music", "mixed"]:
         count = label_counts.get(label, 0)
-        dur = label_durations.get(label, 0.0)
-        pct = (dur / total_duration * 100) if total_duration > 0 else 0
-        print(f"  {label:<10} {count:>6} {dur:>9.1f}s {pct:>9.1f}%")
+        duration = label_durations.get(label, 0.0)
+        percentage = (
+            duration / classified_duration * 100
+            if classified_duration > 0 else 0
+        )
+        print(
+            f"  {label:<10} {count:>6} "
+            f"{duration:>9.1f}s {percentage:>9.1f}%"
+        )
 
-    # Step 7: Save regions to JSON
+    # Save the region list.
     if output_path is None:
         output_path = wav_path.parent / f"{wav_path.stem}_regions.json"
+
     output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(regions, f, indent=2, ensure_ascii=False)
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(regions, file, indent=2, ensure_ascii=False)
 
-    print(f"\n[classifier] Regions saved to: {output_path.name}")
+    print(f"\n[classifier] Regions saved to: {output_path}")
     return regions
 
 
 if __name__ == "__main__":
-    # When run directly, classify Video 1's processed audio
     test_wav = PROJECT_ROOT / "data" / "processed" / "gK017cCH36k.wav"
+
     if test_wav.exists():
         classify_audio(test_wav)
     else:
