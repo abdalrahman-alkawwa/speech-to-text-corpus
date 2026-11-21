@@ -166,105 +166,340 @@ def run_silero_vad_chunked(
     `model` is optional. Supplying an already-loaded model allows callers to
     reuse it across multiple recordings.
     """
+
+    # ---------------------------------------------------------
+    # 1. VALIDATE THE INPUT
+    # ---------------------------------------------------------
+
+    # Silero VAD in this pipeline expects audio sampled at 16,000 Hz.
+    # If the audio has a different sample rate, stop instead of processing
+    # it with incorrect timing assumptions.
     if sr != SAMPLE_RATE:
         raise ValueError(
             f"Silero VAD in this pipeline expects {SAMPLE_RATE} Hz audio; got {sr} Hz."
         )
+
+    # A chunk duration must be positive.
     if chunk_duration_sec <= 0:
         raise ValueError("chunk_duration_sec must be greater than zero.")
 
+    # Validate the audio array (shape, data type, values, etc.).
     audio = _validate_audio_array(audio)
 
-    # Align chunk boundaries to the 50 ms analysis-frame grid. This ensures
-    # that an analysis frame is never split across two chunks.
+    # ---------------------------------------------------------
+    # 2. CALCULATE THE CHUNK SIZE
+    # ---------------------------------------------------------
+
+    # Convert the requested chunk duration from seconds to samples.
+    # Example: 30 seconds * 16,000 samples/second = 480,000 samples.
     requested_chunk_samples = int(round(chunk_duration_sec * sr))
+
+    # Align chunk boundaries to the 800-sample analysis-frame grid.
+    #
+    # Integer division (//) finds how many complete 800-sample frames
+    # fit inside the requested chunk.
+    #
+    # Multiplying by 800 gives the aligned chunk size.
+    #
+    # max() ensures that the chunk is never smaller than one analysis frame.
+    #
+    # Why align chunks?
+    # So an 800-sample analysis frame is never split across two chunks.
     chunk_samples = max(
         FRAME_SIZE_SAMPLES,
         (requested_chunk_samples // FRAME_SIZE_SAMPLES) * FRAME_SIZE_SAMPLES
     )
 
+    # ---------------------------------------------------------
+    # 3. PREPARE THE OUTPUT ARRAY
+    # ---------------------------------------------------------
+
+    # Calculate how many COMPLETE 800-sample analysis frames
+    # exist in the entire audio.
+    #
+    # Example: 480,000 // 800 = 600 frames.
+    # Any incomplete final analysis frame is excluded.
     total_frames = len(audio) // FRAME_SIZE_SAMPLES
+
+    # Create an array to store one final VAD probability per analysis frame.
+    # Initially, every probability is zero.
     frame_probs = np.zeros(total_frames, dtype=np.float32)
 
+    # If the audio is shorter than one complete analysis frame,
+    # there is nothing to process.
     if total_frames == 0:
         return frame_probs
 
+    # If the caller did not supply an already-loaded Silero model,
+    # load one now.
     if model is None:
         model = load_vad_model()
-#We aren't training Silero. We're just using it to make predictions torch.inference_mode()  disables unnecessary gradient tracking and reduces overhead..
 
+    # ---------------------------------------------------------
+    # 4. PROCESS THE AUDIO WITHOUT GRADIENT TRACKING
+    # ---------------------------------------------------------
+
+    # We are using Silero for predictions, not training it.
+    # inference_mode() disables gradient tracking and reduces
+    # unnecessary computation and memory overhead.
     with torch.inference_mode():
+
+        # Divide the audio into chunks.
+        #
+        # chunk_start is the GLOBAL starting sample position
+        # of the current chunk in the original audio.
         for chunk_start in range(0, len(audio), chunk_samples):
+
+            # Find the end of the current chunk.
+            # min() prevents the end from going beyond the audio length.
             chunk_end = min(chunk_start + chunk_samples, len(audio))
+
+            # Extract this chunk from the original audio.
             chunk = audio[chunk_start:chunk_end]
 
+            # Reset Silero's internal states at the beginning of each chunk.
             model.reset_states()
+
+            # Convert the NumPy chunk into a PyTorch tensor
+            # so it can be passed to the Silero model.
             chunk_tensor = torch.from_numpy(chunk)
 
-            # Store each complete VAD window's score. A final incomplete
-            # 512-sample tail is ignored by Silero's fixed-window interface.
+            # -------------------------------------------------
+            # 5. RUN SILERO ON 512-SAMPLE VAD WINDOWS
+            # -------------------------------------------------
+
+            # This list will store one probability for every
+            # complete 512-sample VAD window in the current chunk.
             micro_probs = []
+
+            # Move through the chunk in steps of 512 samples.
+            #
+            # range() uses a step of VAD_WINDOW_SAMPLES (512),
+            # so these VAD windows do NOT overlap each other.
+            #
+            # The +1 in the stopping condition ensures that
+            # only complete 512-sample windows are processed.
+            #
+            # Any incomplete final 512-sample tail is ignored.
             for local_start in range(
                 0, len(chunk_tensor) - VAD_WINDOW_SAMPLES + 1,
                 VAD_WINDOW_SAMPLES
             ):
+
+                # Extract one 512-sample VAD window.
+                #
+                # local_start is the window's position INSIDE
+                # the current chunk, not inside the original audio.
                 window = chunk_tensor[
                     local_start:local_start + VAD_WINDOW_SAMPLES
                 ]
+
+                # Send this window to Silero.
+                # The model returns a speech probability.
+                # .item() extracts the scalar value from the tensor.
+                # float() converts it into a regular Python float.
                 probability = float(model(window, sr).item())
+
+                # Store the probability.
+                # Its list index corresponds to the VAD window index.
                 micro_probs.append(probability)
 
+            # If the chunk did not contain even one complete VAD window,
+            # skip it and continue to the next chunk.
             if not micro_probs:
                 continue
 
+            # Convert the list of probabilities into a NumPy array.
             micro_probs = np.asarray(micro_probs, dtype=np.float32)
 
-            # The chunk boundaries are frame-aligned, so these are exactly
-            # the analysis frames belonging to this chunk.
+            # -------------------------------------------------
+            # 6. FIND THE ANALYSIS FRAMES IN THIS CHUNK
+            # -------------------------------------------------
+
+            # Convert the chunk's GLOBAL starting sample into
+            # the index of its first 800-sample analysis frame.
+            #
+            # Example:
+            # First chunk: 0 // 800 = frame 0
+            # Second chunk: 480000 // 800 = frame 600
             first_frame = chunk_start // FRAME_SIZE_SAMPLES
+
+            # Find the EXCLUSIVE ending frame index.
+            #
+            # chunk_end // 800 gives the first frame index
+            # AFTER the frames belonging to this chunk.
+            #
+            # min() ensures we never go beyond total_frames.
             last_frame = min(
                 total_frames,
                 chunk_end // FRAME_SIZE_SAMPLES
             )
 
+            # Process every analysis frame belonging to this chunk.
+            #
+            # Python range() excludes its ending value.
+            # So range(first_frame, last_frame) includes
+            # first_frame but does NOT include last_frame.
             for frame_index in range(first_frame, last_frame):
+
+                # ---------------------------------------------
+                # 7. GET THE CURRENT ANALYSIS FRAME BOUNDARIES
+                # ---------------------------------------------
+
+                # Calculate the analysis frame's starting position
+                # RELATIVE TO THE CURRENT CHUNK.
+                #
+                # frame_index * 800 gives its GLOBAL sample position.
+                # Subtracting chunk_start converts it to a LOCAL position.
+                #
+                # Example:
+                # Global frame starts at 480000.
+                # Second chunk starts at 480000.
+                # Local frame start = 480000 - 480000 = 0.
                 frame_start = (
                     frame_index * FRAME_SIZE_SAMPLES - chunk_start
                 )
+
+                # The analysis frame contains exactly 800 samples.
+                # Therefore, its ending boundary is start + 800.
                 frame_end = frame_start + FRAME_SIZE_SAMPLES
 
+                # ---------------------------------------------
+                # 8. INITIALIZE THE WEIGHTED-AVERAGE VARIABLES
+                # ---------------------------------------------
+
+                # Will accumulate:
+                # (VAD probability * number of overlapping samples)
+                #
+                # It starts at zero because we have not processed
+                # any overlapping VAD windows yet.
                 weighted_probability = 0.0
+
+                # Counts how many samples of this analysis frame
+                # are covered by the VAD windows we process.
                 covered_samples = 0
 
-                # Determine which VAD windows can overlap this frame.
+                # ---------------------------------------------
+                # 9. FIND WHICH VAD WINDOWS CAN OVERLAP THIS FRAME
+                # ---------------------------------------------
+
+                # Find the index of the first VAD window
+                # that could overlap this analysis frame.
+                #
+                # Integer division by 512 tells us which
+                # 512-sample interval contains frame_start.
+                #
+                # Example:
+                # frame_start = 800
+                # 800 // 512 = 1
                 first_micro = frame_start // VAD_WINDOW_SAMPLES
+
+                # Calculate the EXCLUSIVE ending VAD-window index.
+                #
+                # Adding 512 - 1 before integer division is a way
+                # to round the ending boundary up to the next window
+                # when necessary.
+                #
+                # Example:
+                # frame_end = 1600
+                # (1600 + 512 - 1) // 512 = 4
+                #
+                # range(1, 4) will check windows 1, 2, and 3.
+                #
+                # This is why the code can handle MORE THAN TWO
+                # overlapping VAD windows automatically.
                 last_micro_exclusive = (
                     frame_end + VAD_WINDOW_SAMPLES - 1
                 ) // VAD_WINDOW_SAMPLES
 
+                # ---------------------------------------------
+                # 10. CALCULATE THE OVERLAP WITH EACH VAD WINDOW
+                # ---------------------------------------------
+
+                # Visit every potentially overlapping VAD window.
+                #
+                # min() prevents us from trying to access a VAD
+                # probability index that does not exist.
                 for micro_index in range(
                     first_micro,
                     min(last_micro_exclusive, len(micro_probs))
                 ):
+
+                    # Calculate the current VAD window's starting
+                    # position relative to the current chunk.
+                    #
+                    # Example:
+                    # VAD window index 2 starts at 2 * 512 = 1024.
                     micro_start = micro_index * VAD_WINDOW_SAMPLES
+
+                    # Every VAD window contains 512 samples.
+                    # Calculate its ending boundary.
                     micro_end = micro_start + VAD_WINDOW_SAMPLES
 
+                    # Calculate the number of samples shared
+                    # between the analysis frame and this VAD window.
+                    #
+                    # min(frame_end, micro_end):
+                    #     Finds the earlier ending boundary.
+                    #
+                    # max(frame_start, micro_start):
+                    #     Finds the later starting boundary.
+                    #
+                    # Subtracting them gives the shared length.
+                    #
+                    # max(0, ...) ensures that non-overlapping
+                    # windows produce an overlap of zero, not a
+                    # negative number.
                     overlap = max(
                         0,
                         min(frame_end, micro_end) - max(frame_start, micro_start)
                     )
 
+                    # -----------------------------------------
+                    # 11. ACCUMULATE THE WEIGHTED PROBABILITY
+                    # -----------------------------------------
+
+                    # Only use a VAD window if it actually overlaps
+                    # the current analysis frame.
                     if overlap:
+
+                        # Multiply this VAD window's probability
+                        # by the number of samples it contributes.
+                        #
+                        # A window overlapping 512 samples has
+                        # more influence than one overlapping 64 samples.
                         weighted_probability += (
                             float(micro_probs[micro_index]) * overlap
                         )
+
+                        # Add the number of overlapping samples
+                        # to the total coverage of this analysis frame.
                         covered_samples += overlap
 
+                # ---------------------------------------------
+                # 12. CALCULATE THE FINAL ANALYSIS-FRAME PROBABILITY
+                # ---------------------------------------------
+
+                # Only calculate a probability if at least one
+                # VAD window actually covered part of this frame.
                 if covered_samples:
+
+                    # Calculate the overlap-weighted average:
+                    #
+                    # Sum(VAD probability * overlap)
+                    # --------------------------------------
+                    #          covered samples
+                    #
+                    # We divide by covered_samples rather than
+                    # always dividing by 800 because the final
+                    # portion of a chunk might not have complete
+                    # VAD-window coverage.
                     frame_probs[frame_index] = (
                         weighted_probability / covered_samples
                     )
 
+    # Return the array containing one mapped VAD probability
+    # for each complete 800-sample analysis frame in the audio.
     return frame_probs
 
 
