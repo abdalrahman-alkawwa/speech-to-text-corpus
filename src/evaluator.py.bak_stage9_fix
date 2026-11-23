@@ -1,0 +1,315 @@
+"""
+src/evaluator.py
+================
+Stage 9: Pairwise engine evaluation (WER / CER) and automatic triage.
+
+The idea
+--------
+Two independent ASR engines hear each clip.  If they agree (after Stage 8 removes
+spelling-only differences), the transcript is probably right; if they disagree, a human
+should listen.  This stage measures the disagreement and assigns every clip a label:
+
+    accepted       engines agree, nothing suspicious      -> no review needed
+    review_needed  moderate disagreement or a warning sign -> goes to the Stage 10 queue
+    difficult      strong disagreement or likely not speech -> review first, listen carefully
+
+WER / CER
+---------
+WER = (substitutions + deletions + insertions) / words in the REFERENCE.
+CER is the same at character level (spaces count).  Engine A (Whisper) is the
+reference and engine B (MMS) the hypothesis, so the numbers read as "how much does MMS
+differ from Whisper".  WER can exceed 1.0 when the hypothesis is much longer.  Uses the
+`jiwer` library when it is installed, otherwise an identical built-in implementation.
+
+Triage rules (triage_v1)
+------------------------
+By WER alone:      WER <  accepted_below            -> accepted
+                   accepted_below <= WER <= difficult_above -> review_needed
+                   WER >  difficult_above           -> difficult
+
+Agreement is not proof, so these warning signs stop a clip from being auto-accepted
+(each adds a reason to `triage_reasons`):
+  * region_label is "mixed" or "music"            (the classifier was unsure it was speech)
+  * boundary_check is "flagged_manual_review"      (the cut may be through a word)
+  * engine B has no text for the clip
+  * normalization flags: latin_text, digits_left, decimal_number
+  * Whisper compression_ratio > 2.4 (repetition loop) or avg_logprob < -1.0 (unsure)
+  * WADA SNR below min_snr_db (noisy)
+These make a clip "difficult": engine A text empty, or Whisper no_speech_prob > 0.6.
+
+The thresholds are STARTING values from the project notes; the summary prints how the
+counts would change under other thresholds, so you can calibrate on real data.
+
+Output
+------
+Adds to each record in metadata/<video_id>_transcripts.json:
+    wer, cer, triage_label, triage_reasons, triage_version
+and writes metadata/<video_id>_triage_summary.json.  Raw and normalized texts are never
+changed.
+
+Usage (PowerShell, repository root):
+    python src/evaluator.py                                   # every video
+    python src/evaluator.py --video-id CvrNaPFIwcQ
+    python src/evaluator.py --accepted-below 0.20 --difficult-above 0.50
+"""
+
+import argparse
+import json
+import os
+import statistics
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.normalizer import normalize_arabic, normalize_with_flags
+
+METADATA_DIR = PROJECT_ROOT / "metadata"
+TRIAGE_VERSION = "triage_v1"
+
+try:                                    # optional dependency
+    import jiwer as _jiwer
+except ImportError:                     # pragma: no cover - exercised only without jiwer
+    _jiwer = None
+
+
+@dataclass
+class TriageConfig:
+    accepted_below: float = 0.15         # WER under this -> accepted (if nothing suspicious)
+    difficult_above: float = 0.40        # WER over this  -> difficult
+    max_compression_ratio: float = 2.4   # Whisper repetition-loop warning
+    min_avg_logprob: float = -1.0        # Whisper "unsure" warning
+    max_no_speech_prob: float = 0.6      # Whisper "probably not speech"
+    min_snr_db: Optional[float] = 10.0   # WADA SNR below this -> review (None disables)
+
+
+# --------------------------------------------------------------------------- #
+# WER / CER
+# --------------------------------------------------------------------------- #
+def _edit_distance(a: Sequence, b: Sequence) -> int:
+    """Levenshtein distance (substitution, insertion, deletion all cost 1)."""
+    previous = list(range(len(b) + 1))
+    for i, x in enumerate(a, start=1):
+        current = [i]
+        for j, y in enumerate(b, start=1):
+            current.append(min(previous[j] + 1,              # deletion
+                               current[j - 1] + 1,           # insertion
+                               previous[j - 1] + (x != y)))  # substitution / match
+        previous = current
+    return previous[-1]
+
+
+def _wer_cer_builtin(ref: str, hyp: str) -> Tuple[float, float]:
+    ref_words, hyp_words = ref.split(), hyp.split()
+    wer = _edit_distance(ref_words, hyp_words) / len(ref_words)
+    cer = _edit_distance(list(ref), list(hyp)) / len(ref)
+    return wer, cer
+
+
+def compute_wer_cer(ref: Optional[str], hyp: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+    """(WER, CER) of hyp against ref, or (None, None) if there is no reference text."""
+    ref = " ".join((ref or "").split())
+    hyp = " ".join((hyp or "").split())
+    if not ref:
+        return None, None
+    if _jiwer is not None:
+        return float(_jiwer.wer(ref, hyp)), float(_jiwer.cer(ref, hyp))
+    return _wer_cer_builtin(ref, hyp)
+
+
+# --------------------------------------------------------------------------- #
+# Triage
+# --------------------------------------------------------------------------- #
+def triage_clip(
+    rec: Dict[str, Any],
+    cfg: TriageConfig,
+    region_label: Optional[str] = None,
+    boundary_check: Optional[str] = None,
+    snr_wada_db: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Score one clip.  Returns wer, cer, triage_label and triage_reasons."""
+    text_a, flags_a = normalize_with_flags(rec.get("asr_a_text_norm", rec.get("asr_a_text")))
+    raw_b = rec.get("asr_b_text_norm", rec.get("asr_b_text"))
+    text_b, flags_b = normalize_with_flags(raw_b)
+
+    difficult: List[str] = []
+    review: List[str] = []
+    wer = cer = None
+
+    # --- Whisper's own warning signs ---
+    if not text_a:
+        difficult.append("engine_a_empty")
+    no_speech = rec.get("asr_a_no_speech_prob")
+    if no_speech is not None and no_speech > cfg.max_no_speech_prob:
+        difficult.append("no_speech_prob_high")
+    compression = rec.get("asr_a_compression_ratio")
+    if compression is not None and compression > cfg.max_compression_ratio:
+        review.append("compression_ratio_high")
+    logprob = rec.get("asr_a_avg_logprob")
+    if logprob is not None and logprob < cfg.min_avg_logprob:
+        review.append("avg_logprob_low")
+
+    # --- agreement between the engines ---
+    if text_b is None:
+        review.append("engine_b_missing")
+    elif text_a:
+        wer, cer = compute_wer_cer(text_a, text_b)
+        if wer > cfg.difficult_above:
+            difficult.append(f"wer_above_{cfg.difficult_above:g}")
+        elif wer >= cfg.accepted_below:
+            review.append(f"wer_{cfg.accepted_below:g}_to_{cfg.difficult_above:g}")
+
+    # --- context: where the clip came from ---
+    if region_label in ("mixed", "music"):
+        review.append(f"region_{region_label}")
+    if boundary_check == "flagged_manual_review":
+        review.append("boundary_flagged")
+    if snr_wada_db is not None and cfg.min_snr_db is not None and snr_wada_db < cfg.min_snr_db:
+        review.append("low_snr")
+    for flag in sorted(set(flags_a) | set(flags_b)):
+        if flag != "empty":
+            review.append(f"norm_{flag}")
+
+    label = "difficult" if difficult else ("review_needed" if review else "accepted")
+    return {
+        "wer": None if wer is None else round(wer, 4),
+        "cer": None if cer is None else round(cer, 4),
+        "triage_label": label,
+        "triage_reasons": difficult + review,
+    }
+
+
+def _label_by_wer_only(wer: Optional[float], accepted_below: float, difficult_above: float) -> str:
+    if wer is None:
+        return "review_needed"
+    if wer > difficult_above:
+        return "difficult"
+    return "accepted" if wer < accepted_below else "review_needed"
+
+
+def summarize(records: List[Dict[str, Any]], cfg: TriageConfig) -> Dict[str, Any]:
+    """Counts per label, WER distribution, and a threshold-sensitivity table."""
+    labels = [r["triage_label"] for r in records]
+    wers = sorted(r["wer"] for r in records if r.get("wer") is not None)
+    reasons: Dict[str, int] = {}
+    for r in records:
+        for reason in r["triage_reasons"]:
+            reasons[reason] = reasons.get(reason, 0) + 1
+
+    def quantile(q: float) -> Optional[float]:
+        return None if not wers else round(wers[min(len(wers) - 1, int(q * len(wers)))], 4)
+
+    sensitivity = []
+    for acc, dif in ((0.10, 0.30), (0.15, 0.40), (0.20, 0.50), (0.25, 0.60)):
+        by = [_label_by_wer_only(r.get("wer"), acc, dif) for r in records]
+        sensitivity.append({"accepted_below": acc, "difficult_above": dif,
+                            **{k: by.count(k) for k in ("accepted", "review_needed", "difficult")}})
+    return {
+        "triage_version": TRIAGE_VERSION,
+        "thresholds": asdict(cfg),
+        "segments": len(records),
+        "counts": {k: labels.count(k) for k in ("accepted", "review_needed", "difficult")},
+        "wer": {"n": len(wers), "median": quantile(0.5), "p75": quantile(0.75), "p90": quantile(0.9),
+                "mean": None if not wers else round(statistics.mean(wers), 4)},
+        "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+        "wer_only_sensitivity": sensitivity,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Files
+# --------------------------------------------------------------------------- #
+def _load_json(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _save_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def evaluate_video(
+    video_id: str,
+    metadata_dir: Path = METADATA_DIR,
+    cfg: Optional[TriageConfig] = None,
+) -> Dict[str, Any]:
+    """Evaluate every clip of one video; update its transcripts file; return the summary."""
+    cfg = cfg or TriageConfig()
+    metadata_dir = Path(metadata_dir)
+    path = metadata_dir / f"{video_id}_transcripts.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found - run Stage 7 (transcriber) first.")
+    records = _load_json(path)
+
+    manifest, snr = {}, {}
+    if (metadata_dir / f"{video_id}_segments.json").exists():
+        manifest = {r["segment_id"]: r for r in _load_json(metadata_dir / f"{video_id}_segments.json")}
+    if (metadata_dir / f"{video_id}_snr.json").exists():
+        snr = {r["segment_id"]: r for r in _load_json(metadata_dir / f"{video_id}_snr.json")}
+
+    for rec in records:
+        seg = manifest.get(rec["segment_id"], {})
+        result = triage_clip(
+            rec, cfg,
+            region_label=seg.get("region_label"),
+            boundary_check=seg.get("boundary_check"),
+            snr_wada_db=snr.get(rec["segment_id"], {}).get("snr_wada_db"),
+        )
+        rec.update(result)
+        rec["triage_version"] = TRIAGE_VERSION
+
+    summary = summarize(records, cfg)
+    summary["video_id"] = video_id
+    _save_json(path, records)
+    _save_json(metadata_dir / f"{video_id}_triage_summary.json", summary)
+    return summary
+
+
+def print_summary(summary: Dict[str, Any]) -> None:
+    c, w = summary["counts"], summary["wer"]
+    n = summary["segments"] or 1
+    print(f"\n[evaluator] {summary['video_id']}: {summary['segments']} clips")
+    for label in ("accepted", "review_needed", "difficult"):
+        print(f"  {label:<14} {c[label]:>4}  ({100 * c[label] / n:.0f}%)")
+    print(f"  WER (A vs B): median {w['median']}, p75 {w['p75']}, p90 {w['p90']}  (over {w['n']} clips)")
+    if summary["reasons"]:
+        top = ", ".join(f"{k} x{v}" for k, v in list(summary["reasons"].items())[:6])
+        print(f"  top reasons: {top}")
+    print("  if only WER decided (accepted / review / difficult):")
+    for row in summary["wer_only_sensitivity"]:
+        print(f"    <{row['accepted_below']:.2f} / >{row['difficult_above']:.2f}: "
+              f"{row['accepted']} / {row['review_needed']} / {row['difficult']}")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Stage 9: WER/CER between engines and triage.")
+    parser.add_argument("--video-id", action="append", help="Limit to this video id (repeatable).")
+    parser.add_argument("--accepted-below", type=float, default=TriageConfig.accepted_below)
+    parser.add_argument("--difficult-above", type=float, default=TriageConfig.difficult_above)
+    parser.add_argument("--min-snr-db", type=float, default=TriageConfig.min_snr_db,
+                        help="WADA SNR below this sends a clip to review (default 10).")
+    args = parser.parse_args(argv)
+
+    cfg = TriageConfig(accepted_below=args.accepted_below, difficult_above=args.difficult_above,
+                       min_snr_db=args.min_snr_db)
+    if args.video_id:
+        video_ids = args.video_id
+    else:
+        video_ids = sorted(p.name[: -len("_transcripts.json")] for p in METADATA_DIR.glob("*_transcripts.json"))
+    if not video_ids:
+        print(f"No *_transcripts.json files in {METADATA_DIR}. Run Stage 7 first.")
+        return 1
+    for video_id in video_ids:
+        print_summary(evaluate_video(video_id, cfg=cfg))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

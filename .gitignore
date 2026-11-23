@@ -24,7 +24,8 @@ data/segments/
 
 # Generated outputs
 outputs/
-
+#generated jsons
+metadata/
 # Temporary files
 *.tmp
 *.log

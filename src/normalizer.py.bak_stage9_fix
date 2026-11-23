@@ -1,0 +1,320 @@
+"""
+src/normalizer.py
+=================
+Stage 8: Deterministic Arabic text normalization.
+
+Why this stage exists
+---------------------
+Stage 9 measures how much the two engines disagree (WER/CER).  Raw transcripts
+disagree for reasons that have nothing to do with hearing the audio differently:
+
+    Whisper:  "بال70 هدف"          MMS:  "بالسبعين هدف"      (digits vs words)
+    Whisper:  "الأهداف"            MMS:  "الاهداف"            (hamza spelling)
+    Whisper:  "فبقى"               MMS:  "فبقي"               (ى vs ي)
+    Whisper:  "مرحبا، كيف حالك؟"   MMS:  "مرحبا كيف حالك"     (punctuation)
+
+Normalization maps both texts to one canonical spelling, so the remaining
+differences are real ones.  It is purely rule-based (no model, no randomness), it is
+idempotent (normalizing twice changes nothing), and it NEVER overwrites the raw text:
+results go into separate *_text_norm fields.
+
+The rules (norm_v1)
+-------------------
+ 1. Unicode NFKC (folds Arabic presentation forms such as the lam-alef ligature).
+ 2. Remove invisible direction/format characters, tatweel (ـ) and all diacritics.
+ 3. Arabic-Indic and Persian digits -> 0-9.
+ 4. Letters:  أ إ آ ٱ -> ا     ى -> ي     ة -> ه     ؤ -> و     ئ -> ي
+              Persian ک ی ھ -> ك ي ه
+ 5. "%" -> "في المائة".
+ 6. Whole numbers -> Arabic words (0 .. 999,999,999), e.g. 70 -> سبعين.
+    A number glued to Arabic letters is glued to its words:  بال70 -> بالسبعين.
+    Numbers starting with 0 (phone numbers) and numbers of 10+ digits are read digit by digit.
+    Decimals: 3.5 -> ثلاثة فاصل خمسة (fraction read digit by digit) and flagged "decimal_number".
+ 7. Punctuation and symbols -> space; Latin letters -> lowercase; whitespace collapsed.
+
+What it does NOT do (flagged instead)
+-------------------------------------
+Digits glued to Latin letters (mp3) and English words are left as they are and reported
+in `norm_flags` ("digits_left", "latin_text"); decimals are converted but flagged
+("decimal_number"), because their reading is a convention.  Stage 9/10 can treat flagged
+clips with care.  Number words follow standard written Arabic (oblique forms:
+سبعين, اثنين); an engine that writes a dialect spelling will still differ on numbers.
+
+Usage (PowerShell, repository root):
+    python src/normalizer.py                       # every metadata/*_transcripts.json
+    python src/normalizer.py --video-id CvrNaPFIwcQ --examples 5
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+METADATA_DIR = PROJECT_ROOT / "metadata"
+
+NORM_VERSION = "norm_v1"
+TEXT_FIELDS = ("asr_a_text", "asr_b_text")          # each gets a "<name>_norm" companion
+
+# --------------------------------------------------------------------------- #
+# Character-level rules
+# --------------------------------------------------------------------------- #
+_DIACRITICS = re.compile("[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]")
+_INVISIBLE = re.compile("[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]")
+_TATWEEL = "\u0640"
+
+_DIGIT_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
+_CHAR_MAP = str.maketrans({
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",      # alef with hamza/madda/wasla -> plain alef
+    "ى": "ي",                                      # alef maqsura -> yaa
+    "ة": "ه",                                      # taa marbuta -> haa
+    "ؤ": "و", "ئ": "ي",                            # hamza carriers -> their letters
+    "ک": "ك", "ی": "ي", "ھ": "ه", "ۀ": "ه", "ے": "ي",   # Persian/Urdu look-alikes
+})
+
+_ARABIC_LETTER = re.compile("[\u0621-\u064A]")
+
+
+def _map_chars(text: str) -> str:
+    return text.translate(_CHAR_MAP)
+
+
+# --------------------------------------------------------------------------- #
+# Numbers -> Arabic words
+# --------------------------------------------------------------------------- #
+_ONES = ["صفر", "واحد", "اثنين", "ثلاثة", "اربعة", "خمسة", "ستة", "سبعة", "ثمانية", "تسعة"]
+_TEENS = {10: "عشرة", 11: "احد عشر", 12: "اثني عشر", 13: "ثلاثة عشر", 14: "اربعة عشر",
+          15: "خمسة عشر", 16: "ستة عشر", 17: "سبعة عشر", 18: "ثمانية عشر", 19: "تسعة عشر"}
+_TENS = {2: "عشرين", 3: "ثلاثين", 4: "اربعين", 5: "خمسين", 6: "ستين", 7: "سبعين", 8: "ثمانين", 9: "تسعين"}
+_HUNDREDS = {1: "مائة", 2: "مائتين", 3: "ثلاثمائة", 4: "اربعمائة", 5: "خمسمائة",
+             6: "ستمائة", 7: "سبعمائة", 8: "ثمانمائة", 9: "تسعمائة"}
+
+
+def _below_1000(n: int) -> str:
+    """1..999 in words: hundreds, then units/teens/tens joined with 'و'."""
+    parts: List[str] = []
+    hundreds, rest = divmod(n, 100)
+    if hundreds:
+        parts.append(_HUNDREDS[hundreds])
+    if rest:
+        if rest < 10:
+            parts.append(_ONES[rest])
+        elif rest < 20:
+            parts.append(_TEENS[rest])
+        else:
+            tens, ones = divmod(rest, 10)
+            parts.append(_TENS[tens] if ones == 0 else f"{_ONES[ones]} و{_TENS[tens]}")
+    return " و".join(parts)
+
+
+def _scaled(count: int, singular: str, dual: str, plural: str) -> str:
+    """Words for 'count thousands' / 'count millions' (count is 1..999)."""
+    if count == 1:
+        return singular
+    if count == 2:
+        return dual
+    if count <= 10:
+        return f"{_below_1000(count)} {plural}"
+    return f"{_below_1000(count)} {singular}"
+
+
+def number_to_arabic_words(n: int) -> str:
+    """Whole number 0 .. 999,999,999 in (hamza-free, standard) Arabic words."""
+    if n < 0 or n >= 10 ** 9:
+        raise ValueError("number_to_arabic_words supports 0 .. 999,999,999")
+    if n == 0:
+        return _ONES[0]
+    millions, rest = divmod(n, 10 ** 6)
+    thousands, units = divmod(rest, 1000)
+    parts: List[str] = []
+    if millions:
+        parts.append(_scaled(millions, "مليون", "مليونين", "ملايين"))
+    if thousands:
+        parts.append(_scaled(thousands, "الف", "الفين", "الاف"))
+    if units:
+        parts.append(_below_1000(units))
+    return " و".join(parts)
+
+
+def _digits_one_by_one(digits: str) -> str:
+    return " ".join(_ONES[int(d)] for d in digits)
+
+
+def _number_words(digits: str) -> str:
+    """Words for a run of digits: a number, or digit by digit for phone-like strings."""
+    if len(digits) >= 10 or (len(digits) > 1 and digits[0] == "0"):
+        return _digits_one_by_one(digits)                      # phone numbers, long codes, 007
+    return number_to_arabic_words(int(digits))
+
+
+_DECIMAL = re.compile(r"(?<![0-9])([0-9]+)[.,\u066B]([0-9]+)(?![0-9])")
+
+
+def _expand_decimals(text: str) -> Tuple[str, bool]:
+    """3.5 -> 'ثلاثة فاصل خمسة' (integer part as a number, fraction digit by digit)."""
+    found = False
+
+    def repl(m: "re.Match[str]") -> str:
+        nonlocal found
+        prev = m.string[m.start() - 1] if m.start() > 0 else " "
+        nxt = m.string[m.end()] if m.end() < len(m.string) else " "
+        if (prev.isascii() and prev.isalpha()) or (nxt.isascii() and nxt.isalpha()):
+            return m.group()                                   # glued to Latin letters: v2.5b
+        found = True
+        return f" {_number_words(m.group(1))} فاصل {_digits_one_by_one(m.group(2))} "
+
+    return _DECIMAL.sub(repl, text), found
+
+
+def _expand_numbers(text: str) -> str:
+    """Replace each run of 0-9 by words, handling glued prefixes and Latin-glued digits."""
+
+    def repl(m: "re.Match[str]") -> str:
+        s, start, end = m.string, m.start(), m.end()
+        prev = s[start - 1] if start > 0 else " "
+        nxt = s[end] if end < len(s) else " "
+
+        if (prev.isascii() and prev.isalpha()) or (nxt.isascii() and nxt.isalpha()):
+            return m.group()                                   # glued to Latin letters: mp3, G7
+        words = _number_words(m.group())
+
+        glued_to_arabic = bool(_ARABIC_LETTER.match(prev))     # e.g. بال70 -> بالسبعين
+        lead = "" if (glued_to_arabic or prev.isspace()) else " "
+        tail = "" if (nxt.isspace() or end >= len(s)) else " "
+        return f"{lead}{words}{tail}"
+
+    return re.sub(r"[0-9]+", repl, text)
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+def _flags(text: Optional[str]) -> List[str]:
+    if text is None:
+        return []
+    found = []
+    if re.search(r"[0-9]", text):
+        found.append("digits_left")
+    if re.search(r"[a-z]", text):
+        found.append("latin_text")
+    if text == "":
+        found.append("empty")
+    return found
+
+
+def _normalize(text: Optional[str]) -> Tuple[Optional[str], List[str]]:
+    if text is None:
+        return None, []
+    s = unicodedata.normalize("NFKC", text)
+    s = _INVISIBLE.sub("", s).replace(_TATWEEL, "")
+    s = _DIACRITICS.sub("", s)
+    s = s.translate(_DIGIT_MAP)
+    s = _map_chars(s).lower()
+    s = s.replace("%", " في المائة ").replace("\u066A", " في المائة ")
+    s = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", s)              # 1,000 -> 1000
+    s, had_decimal = _expand_decimals(s)
+    s = _expand_numbers(s)
+    s = _map_chars(s)                                          # the number words need the same spelling rules
+    s = re.sub(r"[^\w\s]|_", " ", s)                           # punctuation / symbols -> space
+    s = re.sub(r"\s+", " ", s).strip()
+    flags = _flags(s) + (["decimal_number"] if had_decimal else [])
+    return s, sorted(set(flags))
+
+
+def normalize_arabic(text: Optional[str]) -> Optional[str]:
+    """Canonical form of an Arabic transcript (see the rules in the module docstring)."""
+    return _normalize(text)[0]
+
+
+def normalize_with_flags(text: Optional[str]) -> Tuple[Optional[str], List[str]]:
+    """(normalized text, flags) - flags: digits_left, latin_text, decimal_number, empty."""
+    return _normalize(text)
+
+
+# --------------------------------------------------------------------------- #
+# Transcript files
+# --------------------------------------------------------------------------- #
+def normalize_records(records: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Add <field>_norm, norm_flags and norm_version to every record (in place).
+
+    Always recomputed: it is instant and deterministic, and it keeps the normalized
+    text in step if a transcript was re-generated.  Raw text is never touched.
+    """
+    changed = flagged = 0
+    for rec in records:
+        flags: List[str] = []
+        for field in TEXT_FIELDS:
+            raw = rec.get(field)
+            norm, field_flags = _normalize(raw)
+            rec[f"{field}_norm"] = norm
+            if raw is not None and norm != raw:
+                changed += 1
+            flags.extend(field_flags)
+        rec["norm_flags"] = sorted(set(flags))
+        rec["norm_version"] = NORM_VERSION
+        flagged += bool(rec["norm_flags"])
+    return {"records": len(records), "texts_changed": changed, "records_flagged": flagged}
+
+
+def _load(path: Path) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _save(path: Path, records: List[Dict[str, Any]]) -> None:
+    """Atomic write: temp file, then replace."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(records, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def normalize_video(video_id: str, metadata_dir: Path = METADATA_DIR) -> Dict[str, int]:
+    """Normalize metadata/<video_id>_transcripts.json in place; return summary counts."""
+    path = Path(metadata_dir) / f"{video_id}_transcripts.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found - run Stage 7 (transcriber) first.")
+    records = _load(path)
+    stats = normalize_records(records)
+    _save(path, records)
+    print(f"[normalizer] {video_id}: {stats['records']} records, {stats['texts_changed']} texts changed, "
+          f"{stats['records_flagged']} flagged -> {path.name}")
+    return stats
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Stage 8: normalize Arabic transcripts.")
+    parser.add_argument("--video-id", action="append", help="Limit to this video id (repeatable).")
+    parser.add_argument("--examples", type=int, default=3, help="Print N before/after examples per video.")
+    args = parser.parse_args(argv)
+
+    if args.video_id:
+        video_ids = args.video_id
+    else:
+        video_ids = sorted(p.name[: -len("_transcripts.json")] for p in METADATA_DIR.glob("*_transcripts.json"))
+    if not video_ids:
+        print(f"No *_transcripts.json files in {METADATA_DIR}. Run Stage 7 first.")
+        return 1
+
+    for video_id in video_ids:
+        normalize_video(video_id)
+        shown = 0
+        for rec in _load(METADATA_DIR / f"{video_id}_transcripts.json"):
+            for field in TEXT_FIELDS:
+                raw, norm = rec.get(field), rec.get(f"{field}_norm")
+                if raw and norm != raw and shown < args.examples:
+                    print(f"  {rec['segment_id']} [{field}]\n    raw : {raw}\n    norm: {norm}")
+                    shown += 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

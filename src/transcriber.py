@@ -1,166 +1,228 @@
 
 """
-Stage 7: ASR transcription of segment clips -> JSON.
+Arabic Speech Corpus — Transcription Stage (Stage 7)
 
-Engine A: faster-whisper, CTranslate2, CUDA fp16.
-Engine B will later add its output to the same JSON records.
+Engine A: faster-whisper large-v3-turbo
+Engine B: Cohere Transcribe Arabic (local Hugging Face model)
 
-Output: metadata/<video_id>_transcripts.json
+Both engines process the same segment WAV files independently.
 
-Features:
-- Raw transcription text (normalization happens in Stage 8).
-- Resumable: completed segments are skipped unless --force is used.
-- Atomic JSON saving.
-- Periodic saving and saving on errors / Ctrl+C.
-- CUDA DLL registration for Windows.
-- GPU memory cleanup after transcription.
+Engine B runs locally; no Cohere API key or internet connection
+is needed after the model has been downloaded and cached.
+
+
+Output:
+    metadata/<video_id>_transcripts.json
+
+The existing transcript records are preserved. Each engine updates
+only its own fields, so running one engine does not overwrite the
+other engine's results.
 """
-
-from __future__ import annotations
 
 import argparse
 import gc
 import json
 import os
-import site
 import sys
+from pathlib import Path
+_DLL_HANDLES = []
+
+if sys.platform == "win32":
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+
+    cuda_dll_dirs = [
+        site_packages / "nvidia" / "cublas" / "bin",
+        site_packages / "nvidia" / "cudnn" / "bin",
+        site_packages / "nvidia" / "cuda_runtime" / "bin",
+    ]
+
+    for dll_dir in cuda_dll_dirs:
+        if dll_dir.is_dir():
+            _DLL_HANDLES.append(
+                os.add_dll_directory(str(dll_dir))
+            )
+
+    # Also expose the DLL directories through PATH.
+    os.environ["PATH"] = (
+        os.pathsep.join(str(p) for p in cuda_dll_dirs if p.is_dir())
+        + os.pathsep
+        + os.environ["PATH"]
+    )
 import time
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
 
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 import soundfile as sf
 
 
-# --------------------------------------------------------------------------- #
-# Project configuration
-# --------------------------------------------------------------------------- #
+# ============================================================
+# 1. PROJECT PATHS AND CONFIGURATION
+# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 SEGMENTS_DIR = PROJECT_ROOT / "data" / "segments"
 METADATA_DIR = PROJECT_ROOT / "metadata"
+
 DEFAULT_DOWNLOAD_ROOT = PROJECT_ROOT / ".cache" / "whisper"
 
-EXPECTED_SAMPLE_RATE = 16_000
+EXPECTED_SAMPLE_RATE = 16000
 SAVE_EVERY_N = 10
+
+
+# ============================================================
+# 2. ENGINE A — FASTER-WHISPER
+# ============================================================
 
 WHISPER_MODEL = "large-v3-turbo"
 WHISPER_ENGINE_TAG = "faster-whisper-large-v3-turbo"
+
 WHISPER_LANGUAGE = "ar"
 WHISPER_BEAM_SIZE = 5
 
-# Keep Windows DLL directory handles alive after load_whisper() returns.
-_DLL_HANDLES = []
+
+# ============================================================
+# 3. ENGINE B — COHERE TRANSCRIBE ARABIC (LOCAL)
+# ============================================================
+
+COHERE_MODEL = "CohereLabs/cohere-transcribe-arabic-07-2026"
+COHERE_ENGINE_TAG = "cohere-transcribe-arabic-07-2026-local"
+
+COHERE_LANGUAGE = "ar"
+COHERE_MAX_NEW_TOKENS = 512
 
 
-# --------------------------------------------------------------------------- #
-# JSON storage
-# --------------------------------------------------------------------------- #
+# ============================================================
+# 4. TRANSCRIPT FILE HELPERS
+# ============================================================
 
-def transcripts_path(
-    video_id: str,
-    metadata_dir: Path = METADATA_DIR
-) -> Path:
-    return Path(metadata_dir) / f"{video_id}_transcripts.json"
+def transcripts_path(video_id: str) -> Path:
+    """Return the JSON file containing all transcripts for a video."""
+    return METADATA_DIR / f"{video_id}_transcripts.json"
 
 
-def load_records(path: Path) -> Dict[str, Dict[str, Any]]:
-    """Load existing transcription records, keyed by segment_id."""
-
-    path = Path(path)
-
+def load_records(path: Path) -> List[Dict[str, Any]]:
+    """Load transcript records, returning an empty list if absent."""
     if not path.exists():
-        return {}
+        raise FileNotFoundError(f"Transcript metadata not found: {path}")
 
-    with open(path, "r", encoding="utf-8") as fh:
-        return {
-            rec["segment_id"]: rec
-            for rec in json.load(fh)
-        }
+    with path.open("r", encoding="utf-8") as f:
+        records = json.load(f)
 
-
-
-def save_records(
-    path: Path,
-    records: Dict[str, Dict[str, Any]]
-) -> None:
-    """Atomically save records to JSON."""
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp = path.with_suffix(path.suffix + ".tmp")
-
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(
-            [records[k] for k in sorted(records)],
-            fh,
-            ensure_ascii=False,
-            indent=2
+    if not isinstance(records, list):
+        raise ValueError(
+            f"Expected a JSON list in {path}, got {type(records).__name__}"
         )
 
-    os.replace(tmp, path)
+    return records
 
 
-# --------------------------------------------------------------------------- #
-# Engine A: faster-whisper
-# --------------------------------------------------------------------------- #
-
-def load_whisper(
-    model_name: str = WHISPER_MODEL,
-    device: str = "cuda",
-    compute_type: str = "float16",
-    download_root: Path = DEFAULT_DOWNLOAD_ROOT,
-):
-    """Load faster-whisper and configure NVIDIA CUDA DLL paths."""
-
-    global _DLL_HANDLES
-
-    # Locate NVIDIA packages in the active virtual environment.
-    nvidia_path = Path(site.getsitepackages()[-1]) / "nvidia"
-
-    # Find all NVIDIA package bin directories.
-    dll_dirs = [
-        path for path in nvidia_path.glob("*/bin")
-        if path.is_dir()
-    ]
-
-    # Register directories with the Windows DLL loader.
-    _DLL_HANDLES = [
-        os.add_dll_directory(str(path))
-        for path in dll_dirs
-    ]
-
-    # Also add them to this process's PATH.
-    os.environ["PATH"] = (
-        os.pathsep.join(str(path) for path in dll_dirs)
-        + os.pathsep
-        + os.environ.get("PATH", "")
-    )
-
-    # Import after configuring DLL search paths.
-    from faster_whisper import WhisperModel
-
-    Path(download_root).mkdir(parents=True, exist_ok=True)
-
-    return WhisperModel(
-        model_name,
-        device=device,
-        compute_type=compute_type,
-        download_root=str(download_root)
-    )
-
-
-def unload_model(model: Any) -> None:
+def save_records(path: Path, records: List[Dict[str, Any]]) -> None:
     """
-    Release GPU memory after transcription.
+    Save transcript records safely.
 
-    The caller must also remove its own model reference.
+    A temporary file is written first. os.replace() then replaces the
+    original file, reducing the risk of losing metadata if interrupted.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+
+    with temporary_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+    os.replace(temporary_path, path)
+
+
+# ============================================================
+# 5. FIND THE WAV FILE ASSOCIATED WITH A SEGMENT
+# ============================================================
+
+def find_segment_audio(
+    video_id: str,
+    record: Dict[str, Any],
+) -> Path:
+    """
+    Locate a segment WAV file.
+
+    First, try any audio path already stored in the record.
+    Then try the common segment directory layouts.
+    Finally, search under data/segments for the segment ID.
     """
 
-    del model
+    segment_id = str(record.get("segment_id", "")).strip()
+
+    if not segment_id:
+        raise ValueError("A transcript record is missing segment_id.")
+
+    # Try paths stored in the metadata record.
+    possible_path_fields = (
+        "wav_path",
+        "audio_path",
+        "audio_file",
+        "segment_path",
+        "file_path",
+    )
+
+    for field in possible_path_fields:
+        stored_path = record.get(field)
+
+        if not stored_path:
+            continue
+
+        candidate = Path(str(stored_path))
+
+        if not candidate.is_absolute():
+            candidate = PROJECT_ROOT / candidate
+
+        if candidate.is_file():
+            return candidate
+
+    # Try common directory layouts.
+    candidates = [
+        SEGMENTS_DIR / video_id / f"{segment_id}.wav",
+        SEGMENTS_DIR / f"{video_id}_{segment_id}.wav",
+        SEGMENTS_DIR / f"{segment_id}.wav",
+    ]
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    # Fallback: search for a WAV whose filename matches the segment ID.
+    if SEGMENTS_DIR.exists():
+        matches = list(SEGMENTS_DIR.rglob(f"{segment_id}.wav"))
+
+        if matches:
+            # Prefer a match inside a directory named after this video.
+            for match in matches:
+                if video_id in str(match):
+                    return match
+
+            return matches[0]
+
+    raise FileNotFoundError(
+        f"Could not find WAV for segment '{segment_id}' "
+        f"belonging to video '{video_id}'."
+    )
+
+
+# ============================================================
+# 6. MODEL MEMORY CLEANUP
+# ============================================================
+
+def unload_model() -> None:
+    """
+    Release unused Python objects and GPU memory.
+
+    This is particularly important because Engine A and Engine B
+    should not occupy GPU memory at the same time.
+    """
     gc.collect()
 
     try:
@@ -168,337 +230,565 @@ def unload_model(model: Any) -> None:
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
-    except ImportError:
+    except Exception:
         pass
 
 
-def transcribe_whisper(
-    model: Any,
-    wav_path: Path,
-    language: Optional[str] = WHISPER_LANGUAGE
-) -> Dict[str, Any]:
-    """Transcribe one audio clip and return its ASR-A fields."""
+# ============================================================
+# 7. LOAD ENGINE A — FASTER-WHISPER
+# ============================================================
 
-    chunks_iter, info = model.transcribe(
+def load_whisper():
+    """Load faster-whisper, with Windows DLL setup when necessary."""
+
+    if os.name == "nt":
+        try:
+            import torch
+
+            torch_lib = Path(torch.__file__).resolve().parent / "lib"
+
+            if torch_lib.is_dir() and hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(str(torch_lib))
+
+        except Exception:
+            pass
+
+    from faster_whisper import WhisperModel
+
+    print(f"\nLoading Engine A: {WHISPER_MODEL}")
+
+    model = WhisperModel(
+        WHISPER_MODEL,
+        device="cuda",
+        compute_type="float16",
+        download_root=str(DEFAULT_DOWNLOAD_ROOT),
+    )
+
+    print("Engine A loaded.")
+
+    return model
+
+
+# ============================================================
+# 8. ENGINE A — TRANSCRIBE ONE SEGMENT
+# ============================================================
+
+def transcribe_whisper(
+    model,
+    wav_path: Path,
+) -> Dict[str, Any]:
+    """
+    Transcribe one WAV file using faster-whisper.
+
+    The returned metadata includes the same diagnostic fields
+    used by the evaluator.
+    """
+
+    segments, info = model.transcribe(
         str(wav_path),
-        language=language,   # None = auto-detect per clip
+        language=WHISPER_LANGUAGE,
         beam_size=WHISPER_BEAM_SIZE,
         vad_filter=False,
         condition_on_previous_text=False,
         word_timestamps=False,
     )
 
-    # faster-whisper returns a generator.
-    # Materialize it to execute transcription.
-    chunks = list(chunks_iter)
+    text_parts = []
 
-    # Combine the text produced by all chunks.
-    text = " ".join(
-        c.text.strip()
-        for c in chunks
-        if c.text.strip()
-    ).strip()
+    weighted_logprob_sum = 0.0
+    total_duration = 0.0
 
-    # Weight each chunk by its duration.
-    weights = [
-        max(float(c.end) - float(c.start), 1e-3)
-        for c in chunks
-    ]
+    no_speech_values = []
+    compression_values = []
 
-    if chunks:
+    for segment in segments:
+        text_parts.append(segment.text.strip())
 
-        # Duration-weighted average log probability.
-        avg_logprob = (
-            sum(
-                float(c.avg_logprob) * w
-                for c, w in zip(chunks, weights)
+        duration = max(
+            0.0,
+            float(segment.end) - float(segment.start),
+        )
+
+        if segment.avg_logprob is not None and duration > 0:
+            weighted_logprob_sum += (
+                float(segment.avg_logprob) * duration
             )
-            / sum(weights)
-        )
+            total_duration += duration
 
-        # Worst-case diagnostic values across chunks.
-        no_speech = max(
-            float(c.no_speech_prob)
-            for c in chunks
-        )
+        if segment.no_speech_prob is not None:
+            no_speech_values.append(float(segment.no_speech_prob))
 
-        compression = max(
-            float(c.compression_ratio)
-            for c in chunks
-        )
+        if segment.compression_ratio is not None:
+            compression_values.append(float(segment.compression_ratio))
 
-    else:
-        # Model returned no chunks.
-        avg_logprob = None
-        no_speech = None
-        compression = None
+    transcript = " ".join(part for part in text_parts if part).strip()
+
+    average_logprob = (
+        weighted_logprob_sum / total_duration
+        if total_duration > 0
+        else None
+    )
 
     return {
         "asr_a_engine": WHISPER_ENGINE_TAG,
-        "asr_a_text": text,
-
-        "asr_a_avg_logprob": (
-            None if avg_logprob is None
-            else round(avg_logprob, 4)
+        "asr_a_text": transcript,
+        "asr_a_language": getattr(info, "language", None),
+        "asr_a_language_probability": getattr(
+            info, "language_probability", None
         ),
-
+        "asr_a_avg_logprob": average_logprob,
         "asr_a_no_speech_prob": (
-            None if no_speech is None
-            else round(no_speech, 4)
+            max(no_speech_values) if no_speech_values else None
         ),
-
         "asr_a_compression_ratio": (
-            None if compression is None
-            else round(compression, 3)
+            max(compression_values) if compression_values else None
         ),
-
-        "asr_a_language": info.language,
-        "asr_a_language_prob": round(
-            float(info.language_probability), 4
-        ),
-
-        "asr_a_n_chunks": len(chunks),
     }
 
 
-# --------------------------------------------------------------------------- #
-# Driver helpers
-# --------------------------------------------------------------------------- #
+# ============================================================
+# 9. LOAD ENGINE B — LOCAL COHERE TRANSCRIBE ARABIC
+# ============================================================
 
-def _check_wav(wav_path: Path) -> float:
-    """Validate audio format and return duration in seconds."""
+def load_cohere():
+    """
+    Load the official Cohere Transcribe Arabic model locally.
 
-    info = sf.info(str(wav_path))
+    On an NVIDIA GPU, use FP16 to reduce memory consumption.
+    If CUDA is unavailable, fall back to CPU inference.
+    """
 
-    problems = []
+    import torch
 
-    if info.samplerate != EXPECTED_SAMPLE_RATE:
-        problems.append(f"sample rate {info.samplerate}")
+    try:
+        from transformers import (
+            AutoProcessor,
+            CohereAsrForConditionalGeneration,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "Your Transformers installation does not include "
+            "CohereAsrForConditionalGeneration.\n"
+            "Install Transformers 5.4.0 or newer."
+        ) from exc
 
-    if info.channels != 1:
-        problems.append(f"{info.channels} channels")
+    if torch.cuda.is_available():
+        device = "cuda"
+        model_dtype = torch.float16
 
-    if info.subtype != "PCM_16":
-        problems.append(f"subtype {info.subtype}")
+        print("\nCUDA detected.")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    if problems:
-        raise ValueError(
-            f"{wav_path.name}: not 16 kHz mono PCM_16 "
-            f"({', '.join(problems)})"
+        free_memory, total_memory = torch.cuda.mem_get_info()
+
+        print(
+            "GPU memory: "
+            f"{free_memory / (1024 ** 3):.2f} GB free / "
+            f"{total_memory / (1024 ** 3):.2f} GB total"
         )
 
-    return float(info.duration)
+    else:
+        device = "cpu"
+        model_dtype = torch.float32
+
+        print("\nCUDA not detected. Cohere will run on CPU.")
+        print("CPU inference will be considerably slower.")
+
+    print(f"\nLoading Engine B: {COHERE_MODEL}")
+    print("The model will be downloaded the first time it is used.")
+
+    processor = AutoProcessor.from_pretrained(COHERE_MODEL)
+
+    model = CohereAsrForConditionalGeneration.from_pretrained(
+        COHERE_MODEL,
+        torch_dtype=model_dtype,
+        device_map="auto" if device == "cuda" else None,
+    )
+
+    if device == "cpu":
+        model = model.to("cpu")
+
+    model.eval()
+
+    print("Engine B loaded.")
+
+    return processor, model
 
 
-def video_id_from_segment(wav_path: Path) -> str:
-    """Extract video ID from a segment filename."""
+# ============================================================
+# 10. ENGINE B — TRANSCRIBE ONE SEGMENT
+# ============================================================
 
-    return wav_path.stem.rsplit("_seg_", 1)[0]
+def transcribe_cohere(
+    processor,
+    model,
+    wav_path: Path,
+) -> Dict[str, Any]:
+    """
+    Transcribe one WAV file using local Cohere Transcribe Arabic.
+
+    The corpus segmenter is expected to produce 16 kHz WAV files.
+    Cohere's processor receives the waveform and language setting.
+    """
+
+    import torch
+
+    audio, sample_rate = sf.read(
+        str(wav_path),
+        dtype="float32",
+    )
+
+    # Convert stereo audio to mono if necessary.
+    if audio.ndim == 2:
+        audio = np.mean(audio, axis=1)
+
+    if audio.ndim != 1:
+        raise ValueError(
+            f"Expected mono audio after conversion: {wav_path}"
+        )
+
+    if sample_rate != EXPECTED_SAMPLE_RATE:
+        raise ValueError(
+            f"Expected {EXPECTED_SAMPLE_RATE} Hz audio, "
+            f"but found {sample_rate} Hz in {wav_path}."
+        )
+
+    # Convert to the format expected by the Cohere processor.
+    inputs = processor(
+        audio,
+        sampling_rate=EXPECTED_SAMPLE_RATE,
+        return_tensors="pt",
+        language=COHERE_LANGUAGE,
+    )
+
+    # Move input tensors to the same device as the model.
+    inputs.to(
+        model.device,
+        dtype=model.dtype,
+    )
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=COHERE_MAX_NEW_TOKENS,
+        )
+
+    # Decode the generated tokens into text.
+    decoded = processor.decode(
+        outputs,
+        skip_special_tokens=True,
+    )
+
+    # Some processor versions return a list; others return a string.
+    if isinstance(decoded, (list, tuple)):
+        transcript = decoded[0] if decoded else ""
+    else:
+        transcript = decoded
+
+    transcript = str(transcript).strip()
+
+    return {
+        "asr_b_engine": COHERE_ENGINE_TAG,
+        "asr_b_text": transcript,
+        "asr_b_confidence": None,
+        "asr_b_language": COHERE_LANGUAGE,
+    }
 
 
-# --------------------------------------------------------------------------- #
-# Video transcription
-# --------------------------------------------------------------------------- #
+# ============================================================
+# 11. TRANSCRIBE ALL SEGMENTS — ENGINE A
+# ============================================================
 
 def transcribe_video(
     video_id: str,
-    model: Any,
-    segments_dir: Path = SEGMENTS_DIR,
-    metadata_dir: Path = METADATA_DIR,
-    force: bool = False,
+    model=None,
     limit: Optional[int] = None,
-    language: Optional[str] = WHISPER_LANGUAGE,
-) -> Path:
-    """Transcribe all pending segments belonging to one video."""
+    force: bool = False,
+) -> None:
+    """
+    Run Engine A on every segment belonging to a video.
 
-    wavs = sorted(
-        Path(segments_dir).glob(f"{video_id}_seg_*.wav")
-    )
+    If force=False, segments that already have a non-empty
+    Engine A transcript are skipped.
+    """
 
-    out_path = transcripts_path(video_id, metadata_dir)
+    path = transcripts_path(video_id)
+    records = load_records(path)
 
-    records = load_records(out_path)
+    own_model = model is None
 
-    # Find segments that have not already been transcribed.
-    pending = [
-        w for w in wavs
-        if force or records.get(w.stem, {}).get("asr_a_text") is None
-    ]
+    if own_model:
+        model = load_whisper()
 
-    # Apply optional limit for testing.
-    todo = pending[:limit] if limit is not None else pending
-
-    print(
-        f"[{video_id}] {len(wavs)} segments, "
-        f"{len(wavs) - len(pending)} already done, "
-        f"{len(todo)} to transcribe now"
-    )
-
-    done = 0
-    audio_sec = 0.0
-    start = time.time()
+    processed = 0
+    skipped = 0
 
     try:
+        for record in records:
 
-        for wav in todo:
+            if limit is not None and processed >= limit:
+                break
 
-            # Validate the segment before transcription.
-            duration = _check_wav(wav)
+            existing_text = record.get("asr_a_text")
 
-            rec = records.get(wav.stem, {})
+            if not force and existing_text:
+                skipped += 1
+                continue
 
-            # Preserve existing fields, including future Engine B fields.
-            rec.update({
-                "segment_id": wav.stem,
+            segment_id = record.get("segment_id", "unknown")
+            wav_path = find_segment_audio(video_id, record)
 
-                "audio_path": (
-                    str(wav.relative_to(PROJECT_ROOT)).replace("\\", "/")
-                    if PROJECT_ROOT in wav.parents
-                    else str(wav)
-                ),
+            print(f"\n[Engine A] {segment_id}")
 
-                "duration_sec": round(duration, 3),
-            })
+            result = transcribe_whisper(model, wav_path)
 
-            # Run Engine A transcription.
-            rec.update(
-                transcribe_whisper(model, wav, language=language)
-            )
+            record.update(result)
 
-            records[wav.stem] = rec
+            processed += 1
 
-            done += 1
-            audio_sec += duration
+            print(f"Transcript: {result['asr_a_text']}")
 
-            # Save periodically.
-            if done % SAVE_EVERY_N == 0:
+            if processed % SAVE_EVERY_N == 0:
+                save_records(path, records)
+                print("Progress saved.")
 
-                save_records(out_path, records)
-
-                rtf = (
-                    (time.time() - start)
-                    / max(audio_sec, 1e-6)
-                )
-
-                print(
-                    f"  {done}/{len(todo)} done "
-                    f"(processing time = {rtf:.2f}x audio duration)"
-                )
+        save_records(path, records)
 
     finally:
+        if own_model:
+            del model
+            unload_model()
 
-        # Save progress even if an exception or Ctrl+C occurs.
-        if records:
-            save_records(out_path, records)
-
-    if done:
-        elapsed = time.time() - start
-        print(
-            f"[{video_id}] transcribed {done} segments ({audio_sec:.0f}s of audio) "
-            f"in {elapsed:.1f}s -> processing time = "
-            f"{elapsed / max(audio_sec, 1e-6):.2f}x audio duration"
-        )
-
-    print(f"[{video_id}] saved -> {out_path}")
-
-    return out_path
+    print(
+        f"\nEngine A finished for {video_id}. "
+        f"Processed: {processed}, skipped: {skipped}"
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Command-line interface
-# --------------------------------------------------------------------------- #
+# ============================================================
+# 12. TRANSCRIBE ALL SEGMENTS — ENGINE B
+# ============================================================
 
-def main(
-    argv: Optional[Sequence[str]] = None
-) -> int:
+def transcribe_video_b(
+    video_id: str,
+    processor=None,
+    model=None,
+    limit: Optional[int] = None,
+    force: bool = False,
+) -> None:
+    """
+    Run local Cohere Transcribe Arabic on every segment.
+
+    If force=False, segments that already have a non-empty
+    Engine B transcript are skipped.
+
+    Engine A fields are preserved.
+    """
+
+    path = transcripts_path(video_id)
+    records = load_records(path)
+
+    own_model = processor is None or model is None
+
+    if own_model:
+        processor, model = load_cohere()
+
+    processed = 0
+    skipped = 0
+
+    try:
+        for record in records:
+
+            if limit is not None and processed >= limit:
+                break
+
+            existing_text = record.get("asr_b_text")
+
+            if not force and existing_text:
+                skipped += 1
+                continue
+
+            segment_id = record.get("segment_id", "unknown")
+            wav_path = find_segment_audio(video_id, record)
+
+            print(f"\n[Engine B] {segment_id}")
+
+            result = transcribe_cohere(
+                processor,
+                model,
+                wav_path,
+            )
+
+            record.update(result)
+
+            processed += 1
+
+            print(f"Transcript: {result['asr_b_text']}")
+
+            if processed % SAVE_EVERY_N == 0:
+                save_records(path, records)
+                print("Progress saved.")
+
+        save_records(path, records)
+
+    finally:
+        if own_model:
+            del model
+            del processor
+            unload_model()
+
+    print(
+        f"\nEngine B finished for {video_id}. "
+        f"Processed: {processed}, skipped: {skipped}"
+    )
+
+
+# ============================================================
+# 13. RUN THE SELECTED ENGINE(S)
+# ============================================================
+
+def run_engines(
+    video_ids: List[str],
+    engines: str = "a",
+    limit: Optional[int] = None,
+    force: bool = False,
+) -> None:
+    """
+    Run Engine A, Engine B, or both.
+
+    When both are selected, Engine A is unloaded before
+    Engine B is loaded to reduce GPU memory pressure.
+    """
+
+    if engines not in ("a", "b", "both"):
+        raise ValueError("engines must be 'a', 'b', or 'both'")
+
+    for video_id in video_ids:
+
+        print("\n" + "=" * 65)
+        print(f"PROCESSING VIDEO: {video_id}")
+        print("=" * 65)
+
+        if engines in ("a", "both"):
+
+            print("\nStarting Engine A...")
+
+            transcribe_video(
+                video_id,
+                limit=limit,
+                force=force,
+            )
+
+            unload_model()
+
+        if engines in ("b", "both"):
+
+            print("\nStarting Engine B...")
+
+            transcribe_video_b(
+                video_id,
+                limit=limit,
+                force=force,
+            )
+
+            unload_model()
+
+
+# ============================================================
+# 14. FIND VIDEO IDS
+# ============================================================
+
+def discover_video_ids() -> List[str]:
+    """Find all transcript metadata files and extract video IDs."""
+
+    if not METADATA_DIR.exists():
+        return []
+
+    suffix = "_transcripts.json"
+
+    video_ids = []
+
+    for path in sorted(METADATA_DIR.glob(f"*{suffix}")):
+        video_ids.append(path.name[:-len(suffix)])
+
+    return video_ids
+
+
+# ============================================================
+# 15. COMMAND-LINE INTERFACE
+# ============================================================
+
+def main() -> None:
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Stage 7 (engine A): "
-            "transcribe segments with faster-whisper."
-        )
+        description="Arabic speech corpus transcription"
     )
 
     parser.add_argument(
         "--video-id",
-        action="append",
-        help="Limit to this video ID (repeatable)."
+        type=str,
+        default=None,
+        help="Process one video ID. If omitted, process all videos.",
     )
 
     parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-transcribe segments that already have text."
+        "--engine",
+        choices=["a", "b", "both"],
+        default="a",
+        help="Select Engine A, Engine B, or both.",
     )
 
     parser.add_argument(
         "--limit",
         type=int,
-        help="Transcribe at most N segments per video."
+        default=None,
+        help="Maximum number of segments to process per video.",
     )
 
     parser.add_argument(
-        "--language",
-        default=WHISPER_LANGUAGE,
-        help='Whisper language code (default "ar"); "auto" detects per clip.'
+        "--force",
+        action="store_true",
+        help="Re-transcribe segments that already have transcripts.",
     )
 
-    parser.add_argument("--model", default=WHISPER_MODEL)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--compute-type", default="float16")
+    args = parser.parse_args()
 
-    parser.add_argument(
-        "--download-root",
-        default=str(DEFAULT_DOWNLOAD_ROOT)
-    )
-
-    args = parser.parse_args(argv)
-
-    # Determine which videos to process.
-    video_ids = (
-        args.video_id
-        or sorted({
-            video_id_from_segment(p)
-            for p in SEGMENTS_DIR.glob("*_seg_*.wav")
-        })
-    )
+    if args.video_id:
+        video_ids = [args.video_id]
+    else:
+        video_ids = discover_video_ids()
 
     if not video_ids:
-        print(
-            f"No segment WAVs found in {SEGMENTS_DIR}. "
-            "Run Stage 5 first."
-        )
-        return 1
+        print("No transcript metadata files were found.")
+        return
 
-    # Load the model.
-    model = load_whisper(
-        args.model,
-        args.device,
-        args.compute_type,
-        Path(args.download_root)
+    print("=" * 65)
+    print("ARABIC SPEECH CORPUS — TRANSCRIPTION")
+    print("=" * 65)
+
+    print(f"Videos found: {len(video_ids)}")
+    print(f"Selected engine: {args.engine}")
+    print(f"Segment limit: {args.limit or 'No limit'}")
+    print(f"Force re-transcription: {args.force}")
+
+    start_time = time.time()
+
+    run_engines(
+        video_ids=video_ids,
+        engines=args.engine,
+        limit=args.limit,
+        force=args.force,
     )
 
-    try:
+    elapsed = time.time() - start_time
 
-        for video_id in video_ids:
-
-            transcribe_video(
-                video_id,
-                model,
-                force=args.force,
-                limit=args.limit,
-                language=None if args.language == "auto" else args.language
-            )
-
-    finally:
-
-        # Release model and GPU memory.
-        unload_model(model)
-        model = None
-
-    return 0
+    print("\n" + "=" * 65)
+    print("TRANSCRIPTION COMPLETE")
+    print(f"Elapsed time: {elapsed / 60:.2f} minutes")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
