@@ -163,6 +163,15 @@ def download_audio(url: str, stem: str, id: str) -> Path:
             "quiet": False,
             "noplaylist": True,
             "no_warnings": True,
+            # Googlevideo connections can stall while streaming long source
+            # audio. Keep yt-dlp's resumable .part file and allow the request
+            # to survive slower responses before retrying.
+            "continuedl": True,
+            "socket_timeout": 60,
+            "retries": 20,
+            "fragment_retries": 20,
+            "extractor_retries": 5,
+            "file_access_retries": 5,
         }
 
         with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:

@@ -102,6 +102,7 @@ def _record(clip, action, text=None, source_text=None):
             final_transcript=text,
             label=label,
             quality=quality,
+            changed_by=st.session_state.get("reviewer", "").strip(),
             metadata_dir=META,
         )
     except (ValueError, KeyError, OSError) as exc:
@@ -156,6 +157,8 @@ if not videos:
 with st.sidebar:
     st.header("Review settings")
 
+    st.text_input("Your name (saved with changes)", key="reviewer")
+
     st.selectbox(
         "Recording",
         videos,
@@ -165,8 +168,8 @@ with st.sidebar:
 
     st.multiselect(
         "Triage labels to show",
-        ["difficult", "review_needed", "accepted"],
-        default=["difficult", "review_needed"],
+        ["difficult", "human_choice", "review_needed", "accepted"],
+        default=["difficult", "human_choice", "review_needed"],
         key="labels",
         on_change=_reset_position,
     )

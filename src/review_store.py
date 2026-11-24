@@ -10,12 +10,13 @@ The JSON files provide the original segment, SNR, and ASR information.
 CSV columns:
     start, end, label, snr, quality,
     model_A_transcript, model_B_transcript,
-    final_transcript, status, segment_id
+    final_transcript, status, segment_id, plus review/audit fields.
 """
 
 import csv
 import json
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -32,11 +33,19 @@ CSV_COLUMNS = [
     "model_B_transcript",
     "final_transcript",
     "status",
+    "review_status",
+    "automatic_status",
     "segment_id",
+    "audio_file",
+    "changed_by",
+    "changed_at",
+    "change_log",
 ]
 
 STATUSES = ("pending", "accepted", "corrected", "rejected")
-TRIAGE_ORDER = {"difficult": 0, "review_needed": 1, "accepted": 2}
+CORPUS_STATUSES = ("accepted", "human_choice", "difficult", "deleted")
+TRIAGE_ORDER = {"difficult": 0, "human_choice": 1, "review_needed": 1, "accepted": 2}
+SNR_CLEAN_THRESHOLD_DB = 20.0
 
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +78,9 @@ def _initial_status(record: Dict[str, Any]) -> str:
     annotation_status = record.get("annotation_status")
     automatic_status = record.get("automatic_status")
 
+    if record.get("triage_label") == "accepted":
+        return "accepted"
+
     if annotation_status == "not_required" and automatic_status == "accepted":
         return "accepted"
 
@@ -76,6 +88,15 @@ def _initial_status(record: Dict[str, Any]) -> str:
         return annotation_status
 
     return "pending"
+
+
+def _corpus_status(triage_label: Optional[str]) -> str:
+    """Map evaluator triage labels to the project CSV's three outcomes."""
+    if triage_label == "accepted":
+        return "accepted"
+    if triage_label in ("human_choice", "review_needed"):
+        return "human_choice"
+    return "difficult"
 
 
 def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
@@ -110,8 +131,8 @@ def ensure_csv(
     """
     Create the per-video review CSV if it does not exist.
 
-    If it already exists, preserve reviewer-controlled fields:
-    label, quality, final_transcript, and status.
+    If it already exists, preserve reviewer-controlled fields, timing,
+    attribution, and manual segment rows.
 
     Original timing, SNR, and model transcripts are refreshed from JSON.
     """
@@ -144,9 +165,33 @@ def ensure_csv(
 
     for record in transcripts:
         sid = record["segment_id"]
+        previous = old_rows.get(sid, {})
+        has_model_transcript = bool(
+            clean_text(record.get("asr_a_text"))
+            or clean_text(record.get("asr_b_text"))
+        )
+        has_saved_human_work = bool(
+            clean_text(previous.get("final_transcript"))
+            or clean_text(previous.get("changed_by"))
+            or previous.get("review_status") in ("accepted", "corrected", "rejected")
+        )
+
+        # Segmentation can produce many more clips than the user selects for
+        # transcription. Keep those untouched clips out of review/export until
+        # at least one engine has supplied text. Retain rows with prior human
+        # work so refreshing the CSV never discards an annotation.
+        if not has_model_transcript and not has_saved_human_work:
+            continue
+
         segment = segment_by_id.get(sid, {})
         snr = snr_by_id.get(sid, {})
-        previous = old_rows.get(sid, {})
+        snr_value = snr.get("snr_wada_db", "")
+        try:
+            initial_quality = (
+                "clean" if float(snr_value) >= SNR_CLEAN_THRESHOLD_DB else "noisy"
+            ) if snr_value not in (None, "") else ""
+        except (TypeError, ValueError):
+            initial_quality = ""
 
         # Segment manifest is the preferred source for timing and region label.
         start = segment.get("start_sec", record.get("start_sec", ""))
@@ -157,24 +202,91 @@ def ensure_csv(
             "start": start,
             "end": end,
             "label": original_label,
-            "snr": snr.get("snr_wada_db", ""),
-            "quality": "",
+            "snr": snr_value,
+            "quality": initial_quality,
             "model_A_transcript": record.get("asr_a_text", ""),
             "model_B_transcript": record.get("asr_b_text", ""),
-            "final_transcript": record.get("final_transcript", ""),
-            "status": _initial_status(record),
+            "final_transcript": (
+                record.get("asr_b_text", "")
+                if _corpus_status(record.get("triage_label")) == "accepted"
+                else record.get("final_transcript", "")
+            ),
+            "status": _corpus_status(record.get("triage_label")),
+            "review_status": _initial_status(record),
+            "automatic_status": _corpus_status(record.get("triage_label")),
             "segment_id": sid,
+            "audio_file": record.get("audio_path") or segment.get("audio_path", ""),
+            "changed_by": "",
+            "changed_at": "",
+            "change_log": "[]",
         }
 
         # Preserve fields that a reviewer may already have edited.
         if previous:
-            for field in ("label", "quality", "final_transcript", "status"):
+            prior_workflow = previous.get("review_status") or previous.get("status", "")
+            if prior_workflow not in STATUSES and prior_workflow != "deleted":
+                prior_workflow = (
+                    prior_workflow if prior_workflow in STATUSES
+                    else _initial_status(record)
+                )
+            prior_corpus = previous.get("status", "")
+            has_human_decision = bool(previous.get("changed_by")) or prior_workflow in ("corrected", "rejected")
+            if prior_workflow == "deleted" or prior_corpus == "deleted":
+                row["review_status"] = "deleted"
+                row["status"] = "deleted"
+            elif has_human_decision:
+                row["review_status"] = prior_workflow
+                if prior_corpus in CORPUS_STATUSES:
+                    row["status"] = prior_corpus
+                elif prior_workflow in ("accepted", "corrected"):
+                    row["status"] = "accepted"
+                elif prior_workflow == "rejected":
+                    row["status"] = "difficult"
+                else:
+                    row["status"] = row["automatic_status"]
+            else:
+                row["review_status"] = _initial_status(record)
+            for field in (
+                "start", "end", "label", "quality", "final_transcript", "audio_file",
+                "changed_by", "changed_at", "change_log",
+            ):
                 if field in previous:
+                    if (
+                        field == "final_transcript"
+                        and not has_human_decision
+                        and row["automatic_status"] == "accepted"
+                    ):
+                        # Keep automatic acceptance consistent with the
+                        # selected Engine B transcript, including older CSVs
+                        # that were initialized from Engine A.
+                        continue
                     row[field] = previous[field]
 
         new_rows.append(row)
 
     new_rows.sort(key=lambda r: r["segment_id"])
+    # Keep manually added/split/merged rows, which do not exist in the
+    # machine-generated transcript JSON. Their CSV record is authoritative.
+    known_ids = {row["segment_id"] for row in new_rows}
+    generated_ids = {record["segment_id"] for record in transcripts}
+    for sid, previous in old_rows.items():
+        if sid not in known_ids:
+            if sid in generated_ids:
+                # This is a machine-generated segment that has not been
+                # transcribed yet, rather than a manually added CSV row.
+                # Leave it out until an engine transcript or human annotation
+                # exists.
+                continue
+            manual = {column: previous.get(column, "") for column in CSV_COLUMNS}
+            new_rows.append(manual)
+    def _time_order(row):
+        try:
+            start_time = float(row.get("start", ""))
+        except (TypeError, ValueError):
+            start_time = float("inf")
+        return start_time, row["segment_id"]
+
+    new_rows.sort(key=_time_order)
     _write_csv(output_path, new_rows)
     return output_path
 
@@ -238,7 +350,7 @@ def load_clips(
         if clip["start_sec"] is not None and clip["end_sec"] is not None:
             clip["duration_sec"] = clip["end_sec"] - clip["start_sec"]
 
-        audio_path = transcript.get("audio_path") or segment.get("audio_path")
+        audio_path = row.get("audio_file") or transcript.get("audio_path") or segment.get("audio_path")
         clip["audio_path"] = audio_path
         clip["audio_abspath"] = (
             str(Path(root) / audio_path) if audio_path else None
@@ -246,7 +358,13 @@ def load_clips(
 
         clips.append(clip)
 
-    return sorted(clips, key=lambda c: c["segment_id"])
+    return sorted(
+        clips,
+        key=lambda c: (
+            c["start_sec"] if c.get("start_sec") is not None else float("inf"),
+            c["segment_id"],
+        ),
+    )
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -281,7 +399,9 @@ def latest_decisions(
 def status_of(decision: Optional[Dict[str, Any]]) -> str:
     if decision is None:
         return "pending"
-    status = decision.get("status", "pending")
+    status = decision.get("review_status", decision.get("status", "pending"))
+    if status == "deleted":
+        return "deleted"
     return status if status in STATUSES else "pending"
 
 
@@ -292,9 +412,11 @@ def progress(
     counts = {status: 0 for status in STATUSES}
 
     for clip in clips:
-        counts[status_of(decisions.get(clip["segment_id"]))] += 1
+        status = status_of(decisions.get(clip["segment_id"]))
+        if status != "deleted":
+            counts[status] += 1
 
-    counts["total"] = len(clips)
+    counts["total"] = sum(counts.values())
     return counts
 
 
@@ -305,6 +427,11 @@ def update_review(
     final_transcript: Optional[str] = None,
     label: Optional[str] = None,
     quality: Optional[str] = None,
+    changed_by: Optional[str] = None,
+    start: Optional[float] = None,
+    end: Optional[float] = None,
+    snr: Optional[float] = None,
+    audio_file: Optional[str] = None,
     metadata_dir: Path = METADATA_DIR,
 ) -> None:
     """Update one segment's annotation fields directly in its CSV row."""
@@ -313,6 +440,11 @@ def update_review(
 
     if status in ("accepted", "corrected") and not clean_text(final_transcript):
         raise ValueError("An accepted or corrected clip needs a final transcript.")
+    reviewer = clean_text(changed_by)
+    if not reviewer:
+        raise ValueError("Enter your name before saving a review change.")
+    if start is not None and end is not None and float(end) <= float(start):
+        raise ValueError("Segment end must be later than segment start.")
 
     path = csv_path(video_id, metadata_dir)
     if not path.exists():
@@ -323,7 +455,26 @@ def update_review(
 
     for row in rows:
         if row.get("segment_id") == segment_id:
-            row["status"] = status
+            before = {
+                "status": row.get("status", "difficult"),
+                "review_status": row.get("review_status", row.get("status", "pending")),
+                "final_transcript": row.get("final_transcript", ""),
+                "label": row.get("label", ""),
+                "quality": row.get("quality", ""),
+                "snr": row.get("snr", ""),
+                "audio_file": row.get("audio_file", ""),
+            }
+            before.update({
+                key: row.get(key, "")
+                for key in ("start", "end")
+            })
+            row["review_status"] = status
+            if status in ("accepted", "corrected"):
+                row["status"] = "accepted"
+            elif status == "rejected":
+                row["status"] = "difficult"
+            elif status == "pending":
+                row["status"] = row.get("automatic_status") or "human_choice"
 
             if final_transcript is not None:
                 row["final_transcript"] = clean_text(final_transcript) or ""
@@ -333,6 +484,41 @@ def update_review(
 
             if quality is not None:
                 row["quality"] = quality
+            if start is not None:
+                row["start"] = round(float(start), 3)
+            if end is not None:
+                row["end"] = round(float(end), 3)
+            if snr is not None:
+                row["snr"] = round(float(snr), 2)
+            if audio_file is not None:
+                row["audio_file"] = audio_file
+
+            after = {
+                "status": row.get("status", "difficult"),
+                "review_status": row.get("review_status", "pending"),
+                "final_transcript": row.get("final_transcript", ""),
+                "label": row.get("label", ""),
+                "quality": row.get("quality", ""),
+                "snr": row.get("snr", ""),
+                "audio_file": row.get("audio_file", ""),
+                "start": row.get("start", ""),
+                "end": row.get("end", ""),
+            }
+            if before != after:
+                stamp = datetime.now(timezone.utc).isoformat()
+                try:
+                    history = json.loads(row.get("change_log") or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    history = []
+                history.append({
+                    "changed_at": stamp,
+                    "changed_by": reviewer,
+                    "before": before,
+                    "after": after,
+                })
+                row["changed_by"] = reviewer
+                row["changed_at"] = stamp
+                row["change_log"] = json.dumps(history, ensure_ascii=False)
 
             found = True
             break
@@ -341,6 +527,194 @@ def update_review(
         raise KeyError(f"Segment {segment_id} was not found in {path.name}")
 
     _write_csv(path, rows)
+
+
+def _manual_id(video_id: str, rows: Sequence[Dict[str, str]]) -> str:
+    """Allocate a stable-looking ID that cannot collide with generated IDs."""
+    existing = {row.get("segment_id", "") for row in rows}
+    index = 1
+    while f"{video_id}_manual_{index:04d}" in existing:
+        index += 1
+    return f"{video_id}_manual_{index:04d}"
+
+
+def _append_manual_row(
+    video_id: str,
+    rows: List[Dict[str, str]],
+    start: float,
+    end: float,
+    label: str,
+    quality: str,
+    reviewer: str,
+    operation: str,
+    snr: Optional[float] = None,
+) -> str:
+    sid = _manual_id(video_id, rows)
+    stamp = datetime.now(timezone.utc).isoformat()
+    event = {
+        "changed_at": stamp,
+        "changed_by": reviewer,
+        "operation": operation,
+        "before": None,
+        "after": {
+            "start": round(float(start), 3),
+            "end": round(float(end), 3),
+            "label": label,
+            "quality": quality,
+            "snr": round(float(snr), 2) if snr is not None else "",
+            "status": "pending",
+        },
+    }
+    rows.append({
+        "start": round(float(start), 3),
+        "end": round(float(end), 3),
+        "label": label,
+        "snr": round(float(snr), 2) if snr is not None else "",
+        "quality": quality or (
+            "clean" if snr is not None and float(snr) >= SNR_CLEAN_THRESHOLD_DB
+            else "noisy" if snr is not None else ""
+        ),
+        "model_A_transcript": "",
+        "model_B_transcript": "",
+        "final_transcript": "",
+        "status": "human_choice",
+        "review_status": "pending",
+        "automatic_status": "human_choice",
+        "segment_id": sid,
+        "changed_by": reviewer,
+        "changed_at": stamp,
+        "change_log": json.dumps([event], ensure_ascii=False),
+    })
+    return sid
+
+
+def add_segment(
+    video_id: str,
+    start: float,
+    end: float,
+    reviewer: str,
+    label: str = "speech",
+    quality: str = "",
+    snr: Optional[float] = None,
+    metadata_dir: Path = METADATA_DIR,
+) -> str:
+    """Add a manually timed segment to the per-video CSV."""
+    reviewer = clean_text(reviewer)
+    if not reviewer:
+        raise ValueError("Enter your name before changing segment structure.")
+    if label not in ("speech", "music", "mixed"):
+        raise ValueError("Segment label must be speech, music, or mixed.")
+    if float(start) < 0 or float(end) <= float(start):
+        raise ValueError("Segment times must satisfy 0 <= start < end.")
+    path = csv_path(video_id, metadata_dir)
+    if not path.exists():
+        ensure_csv(video_id, metadata_dir)
+    rows = _read_csv(path)
+    sid = _append_manual_row(video_id, rows, start, end, label, quality, reviewer, "add", snr)
+    _write_csv(path, rows)
+    return sid
+
+
+def delete_segment(
+    video_id: str,
+    segment_id: str,
+    reviewer: str,
+    metadata_dir: Path = METADATA_DIR,
+) -> None:
+    """Mark a segment deleted while retaining its row and audit trail."""
+    reviewer = clean_text(reviewer)
+    if not reviewer:
+        raise ValueError("Enter your name before changing segment structure.")
+    path = csv_path(video_id, metadata_dir)
+    rows = _read_csv(path)
+    for row in rows:
+        if row.get("segment_id") == segment_id:
+            if row.get("status") == "deleted":
+                return
+            before = {key: row.get(key, "") for key in ("start", "end", "label", "status", "review_status")}
+            row["status"] = "deleted"
+            row["review_status"] = "deleted"
+            stamp = datetime.now(timezone.utc).isoformat()
+            try:
+                history = json.loads(row.get("change_log") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                history = []
+            history.append({"changed_at": stamp, "changed_by": reviewer,
+                            "operation": "delete", "before": before,
+                            "after": {**before, "status": "deleted", "review_status": "deleted"}})
+            row["changed_by"] = reviewer
+            row["changed_at"] = stamp
+            row["change_log"] = json.dumps(history, ensure_ascii=False)
+            _write_csv(path, rows)
+            return
+    raise KeyError(f"Segment {segment_id} was not found in {path.name}")
+
+
+def split_segment(
+    video_id: str,
+    segment_id: str,
+    split_at: float,
+    reviewer: str,
+    metadata_dir: Path = METADATA_DIR,
+    snrs: Optional[Sequence[Optional[float]]] = None,
+) -> List[str]:
+    """Replace one active row with two manually timed child rows."""
+    path = csv_path(video_id, metadata_dir)
+    rows = _read_csv(path)
+    row = next((r for r in rows if r.get("segment_id") == segment_id), None)
+    if row is None:
+        raise KeyError(f"Segment {segment_id} was not found in {path.name}")
+    start, end = float(row["start"]), float(row["end"])
+    split_at = float(split_at)
+    if not start < split_at < end:
+        raise ValueError("Split point must be inside the segment.")
+    reviewer = clean_text(reviewer)
+    if not reviewer:
+        raise ValueError("Enter your name before changing segment structure.")
+    child_snrs = list(snrs or [None, None])
+    if len(child_snrs) != 2:
+        raise ValueError("A split needs one SNR value for each new segment.")
+    label, quality = row.get("label") or "speech", row.get("quality") or ""
+    delete_segment(video_id, segment_id, reviewer, metadata_dir)
+    rows = _read_csv(path)
+    first = _append_manual_row(video_id, rows, start, split_at, label, quality, reviewer, f"split_from:{segment_id}", child_snrs[0])
+    second = _append_manual_row(video_id, rows, split_at, end, label, quality, reviewer, f"split_from:{segment_id}", child_snrs[1])
+    _write_csv(path, rows)
+    return [first, second]
+
+
+def merge_segments(
+    video_id: str,
+    segment_ids: Sequence[str],
+    reviewer: str,
+    metadata_dir: Path = METADATA_DIR,
+    snr: Optional[float] = None,
+) -> str:
+    """Replace two selected active segments with one manually merged row."""
+    if len(segment_ids) != 2 or segment_ids[0] == segment_ids[1]:
+        raise ValueError("Choose exactly two different segments to merge.")
+    path = csv_path(video_id, metadata_dir)
+    rows = _read_csv(path)
+    chosen = [next((r for r in rows if r.get("segment_id") == sid), None) for sid in segment_ids]
+    if any(row is None for row in chosen):
+        raise KeyError("One of the selected segments is missing from the CSV.")
+    if any(row.get("status") == "deleted" for row in chosen):
+        raise ValueError("Deleted segments cannot be merged.")
+    reviewer = clean_text(reviewer)
+    if not reviewer:
+        raise ValueError("Enter your name before changing segment structure.")
+    ordered = sorted(chosen, key=lambda r: float(r["start"]))
+    start = float(ordered[0]["start"])
+    end = max(float(row["end"]) for row in ordered)
+    label = ordered[0].get("label") or "speech"
+    quality = ordered[0].get("quality") or ""
+    for row in ordered:
+        delete_segment(video_id, row["segment_id"], reviewer, metadata_dir)
+    rows = _read_csv(path)
+    sid = _append_manual_row(video_id, rows, start, end, label, quality, reviewer,
+                             f"merge:{segment_ids[0]}+{segment_ids[1]}", snr)
+    _write_csv(path, rows)
+    return sid
 
 
 # --------------------------------------------------------------------------- #
@@ -367,6 +741,9 @@ def build_queue(
     for clip in clips:
         triage_label = clip.get("triage_label") or "review_needed"
 
+        if status_of(decisions.get(clip["segment_id"])) == "deleted":
+            continue
+
         if labels is not None and triage_label not in labels:
             continue
 
@@ -378,7 +755,13 @@ def build_queue(
         selected.append(clip)
 
     if order == "recording":
-        return sorted(selected, key=lambda c: c["segment_id"])
+        return sorted(
+            selected,
+            key=lambda c: (
+                c.get("start_sec") if c.get("start_sec") is not None else float("inf"),
+                c["segment_id"],
+            ),
+        )
 
     if order == "random":
         shuffled = sorted(selected, key=lambda c: c["segment_id"])

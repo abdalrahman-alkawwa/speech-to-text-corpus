@@ -94,7 +94,9 @@ COHERE_MODEL = "CohereLabs/cohere-transcribe-arabic-07-2026"
 COHERE_ENGINE_TAG = "cohere-transcribe-arabic-07-2026-local"
 
 COHERE_LANGUAGE = "ar"
-COHERE_MAX_NEW_TOKENS = 512
+# The Cohere model card's offline quick start uses 256. 512 allowed pathological
+# repetition loops to consume the entire generation budget on short clips.
+COHERE_MAX_NEW_TOKENS = 256
 
 
 # ============================================================
@@ -475,6 +477,13 @@ def transcribe_cohere(
             max_new_tokens=COHERE_MAX_NEW_TOKENS,
         )
 
+    generated_tokens, hit_token_limit = _generation_diagnostics(
+        outputs=outputs,
+        inputs=inputs,
+        model=model,
+        max_new_tokens=COHERE_MAX_NEW_TOKENS,
+    )
+
     # Decode the generated tokens into text.
     decoded = processor.decode(
         outputs,
@@ -489,12 +498,84 @@ def transcribe_cohere(
 
     transcript = str(transcript).strip()
 
+    quality_flags = _transcript_quality_flags(transcript)
+    if hit_token_limit:
+        quality_flags.insert(0, "token_limit_reached")
+
     return {
         "asr_b_engine": COHERE_ENGINE_TAG,
         "asr_b_text": transcript,
         "asr_b_confidence": None,
         "asr_b_language": COHERE_LANGUAGE,
+        "asr_b_generated_tokens": generated_tokens,
+        "asr_b_hit_token_limit": hit_token_limit,
+        "asr_b_quality_flags": quality_flags,
     }
+
+
+def _generation_diagnostics(outputs, inputs, model, max_new_tokens: int) -> Tuple[int, bool]:
+    """Return generated-token count and whether generation stopped at its cap."""
+    sequences = getattr(outputs, "sequences", outputs)
+    shape = getattr(sequences, "shape", ())
+    if not shape:
+        return 0, False
+
+    sequence_length = int(shape[-1])
+    decoder_inputs = inputs.get("decoder_input_ids")
+    if decoder_inputs is not None:
+        prompt_length = int(decoder_inputs.shape[-1])
+    else:
+        # Encoder-decoder generation normally begins with one decoder-start token.
+        prompt_length = 1 if getattr(model, "generation_config", None) is not None else 0
+
+    generated_tokens = max(0, sequence_length - prompt_length)
+    if generated_tokens < max_new_tokens:
+        return generated_tokens, False
+
+    # EOS at the final position means the model ended normally on the last
+    # permitted token. Otherwise the transcript may have been cut off.
+    generation_config = getattr(model, "generation_config", None)
+    eos_token_id = getattr(generation_config, "eos_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None)
+    if isinstance(eos_token_id, (tuple, list, set)):
+        eos_ids = {int(token_id) for token_id in eos_token_id}
+    elif eos_token_id is None:
+        eos_ids = set()
+    else:
+        eos_ids = {int(eos_token_id)}
+
+    try:
+        last_token = int(sequences[0, -1])
+    except (IndexError, TypeError, ValueError):
+        last_token = None
+    return generated_tokens, last_token not in eos_ids
+
+
+def _transcript_quality_flags(text: str) -> List[str]:
+    """Flag obvious decoder degeneration without changing the raw transcript."""
+    flags = []
+    words = text.split()
+
+    longest_word_run = 1
+    current_word_run = 1
+    for previous, current in zip(words, words[1:]):
+        current_word_run = current_word_run + 1 if current == previous else 1
+        longest_word_run = max(longest_word_run, current_word_run)
+
+    if longest_word_run >= 8:
+        flags.append("repetition_loop")
+
+    visible = [char for char in text if not char.isspace()]
+    if len(visible) >= 16 and visible:
+        most_common_fraction = max(text.count(char) for char in set(visible)) / len(visible)
+        if most_common_fraction >= 0.8:
+            flags.append("character_loop")
+
+    if any(len(word) >= 40 and len(set(word)) <= 3 for word in words):
+        flags.append("character_loop")
+
+    return sorted(set(flags))
 
 
 # ============================================================

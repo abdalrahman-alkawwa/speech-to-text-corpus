@@ -1,249 +1,808 @@
-"""
-app.py
-======
-Arabic Labelled Speech Corpus Studio — Interactive Web UI (Streamlit)
+"""Arabic Speech Corpus Studio: pipeline, segment review, and CSV export."""
 
-Purpose:
---------
-Provides an interactive, visual web dashboard to:
-  1. Ingest and process online Arabic videos through Stages 1 to 5.
-  2. Inspect Waveform, Spectrogram, and Amplitude Envelopes.
-  3. Browse 4-class region classifications (Speech / Silence / Music / Mixed).
-  4. Play and verify individual 8–12s speech segments with built-in audio players.
-"""
-
-import sys
-import os
+import io
 import json
+import sys
+import csv
 from pathlib import Path
+from datetime import datetime, timezone
 
-# Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import streamlit as st
 import pandas as pd
+import numpy as np
 import soundfile as sf
+import streamlit as st
+import matplotlib.pyplot as plt
+from scipy.signal import spectrogram
 
+from src import review_store as rs
 from src.pipeline import run_pipeline
+from src.snr_estimator import estimate_wada_snr
 
+META = PROJECT_ROOT / "metadata"
+LABELS = ["speech", "music", "mixed"]
+QUALITIES = ["", "clean", "noisy"]
+TRIAGE_LABELS = ["difficult", "human_choice", "review_needed", "accepted"]
 
-# Page Configuration
 st.set_page_config(
     page_title="Arabic Speech Corpus Studio",
     page_icon="🎙️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+)
+st.markdown(
+    """<style>
+    .block-container {padding-top: 1.6rem;}
+    .rtl {direction:rtl;text-align:right;font-size:1.2rem;line-height:1.8;
+          padding:.55rem .7rem;border:1px solid rgba(128,128,128,.35);
+          border-radius:8px;white-space:pre-wrap;}
+    textarea {direction:rtl;text-align:right;font-size:1.15rem;}
+    </style>""",
+    unsafe_allow_html=True,
 )
 
-# Custom Styling for clean presentation
-st.markdown("""
-<style>
-    .main-title { font-size: 2.2rem; font-weight: 700; color: #1E3A8A; margin-bottom: 0.2rem; }
-    .sub-title { font-size: 1.05rem; color: #4B5563; margin-bottom: 1.5rem; }
-    .metric-card { background: #F3F4F6; padding: 1rem; border-radius: 8px; border-left: 4px solid #3B82F6; }
-    .badge-verified { background-color: #D1FAE5; color: #065F46; padding: 3px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }
-    .badge-review { background-color: #FEF3C7; color: #92400E; padding: 3px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }
-</style>
-""", unsafe_allow_html=True)
+
+def _videos():
+    return rs.list_videos(META)
 
 
-def list_available_recordings():
-    """Finds all recordings with metadata JSON in the metadata/ folder."""
-    meta_dir = PROJECT_ROOT / "metadata"
-    records = []
-    if meta_dir.exists():
-        for f in meta_dir.glob("*.json"):
-            try:
-                with open(f, "r", encoding="utf-8") as jf:
-                    data = json.load(jf)
-                    records.append(data)
-            except Exception:
-                pass
-    return records
+def _reset_review_position():
+    st.session_state["review_pos"] = 0
 
 
-# ============================================================
-#  SIDEBAR
-# ============================================================
-with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/audio-wave.png", width=64)
-    st.markdown("### 🎙️ Corpus Navigation")
+def _audio_bytes(path: Path, start: float = None, end: float = None):
+    # Seek into the source WAV so reviewing one short cut never loads a
+    # multi-hour recording into memory.
+    with sf.SoundFile(str(path), mode="r") as source:
+        sr = source.samplerate
+        left = max(0, int((start or 0.0) * sr))
+        right = source.frames if end is None else min(source.frames, int(end * sr))
+        source.seek(left)
+        audio = source.read(max(0, right - left), dtype="float32", always_2d=False)
+    if not len(audio):
+        return None
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, sr, format="WAV", subtype="PCM_16")
+    return buffer.getvalue()
 
-    menu_option = st.radio(
-        "Select Workspace:",
-        [
-            "🚀 Ingest & Process Video",
-            "🎧 Browse & Play Segments",
-            "📊 Audio & Region Analysis"
-        ]
+
+def _wada_snr(path: Path, start: float, end: float):
+    """Estimate WADA SNR for a short source-audio span without writing a WAV."""
+    with sf.SoundFile(str(path), mode="r") as source:
+        sr = source.samplerate
+        left = max(0, int(start * sr))
+        right = min(source.frames, int(end * sr))
+        source.seek(left)
+        samples = source.read(max(0, right - left), dtype="float64", always_2d=False)
+    value = estimate_wada_snr(samples)
+    return None if value is None else round(float(value), 2)
+
+
+def _save_reviewed_audio(video_id: str, segment_id: str, source_path: Path, start: float, end: float):
+    """Write a corrected segment copy without changing the original WAV."""
+    with sf.SoundFile(str(source_path), mode="r") as source:
+        sr = source.samplerate
+        first = max(0, int(start * sr))
+        last = min(source.frames, int(end * sr))
+        if last <= first:
+            raise ValueError("The corrected segment contains no audio frames.")
+        source.seek(first)
+        samples = source.read(last - first, dtype="float32", always_2d=False)
+    destination = PROJECT_ROOT / "data" / "reviewed_segments" / video_id / f"{segment_id}.wav"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(destination), samples, sr, subtype="PCM_16")
+    return destination.relative_to(PROJECT_ROOT).as_posix()
+
+
+def _region_spectrogram(path: Path, regions, start: float, duration: float = 10.0):
+    """Draw one short spectrogram with the saved region labels overlaid."""
+    with sf.SoundFile(str(path), mode="r") as source:
+        sr = source.samplerate
+        first = max(0, int(start * sr))
+        source.seek(first)
+        audio = source.read(int(duration * sr), dtype="float32", always_2d=False)
+    if len(audio) < 32:
+        return None
+    nperseg = min(1024, len(audio))
+    frequencies, times, power = spectrogram(audio, fs=sr, nperseg=nperseg)
+    db = 10 * np.log10(np.maximum(power, 1e-12))
+    figure, axis = plt.subplots(figsize=(12, 4))
+    axis.pcolormesh(times + start, frequencies, db, shading="auto", cmap="magma")
+    colors = {"speech": "#22c55e", "silence": "#94a3b8", "music": "#a78bfa", "mixed": "#f59e0b"}
+    finish = start + len(audio) / sr
+    for region in regions:
+        left = max(start, float(region.get("start_sec", 0)))
+        right = min(finish, float(region.get("end_sec", 0)))
+        if left >= right:
+            continue
+        label = str(region.get("label", "mixed"))
+        axis.axvspan(left, right, color=colors.get(label, "#38bdf8"), alpha=0.15)
+        axis.text((left + right) / 2, sr / 2, label, color="white", ha="center", va="top", fontsize=8)
+    axis.set_ylim(0, min(8000, sr / 2))
+    axis.set_xlabel("Time in recording (seconds)")
+    axis.set_ylabel("Frequency (Hz)")
+    axis.set_title("Spectrogram with classified region spans")
+    figure.tight_layout()
+    return figure
+
+
+def _source_wav(video_id: str):
+    metadata_path = META / f"{video_id}.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        relative = metadata.get("audio_properties", {}).get("processed_file")
+        path = PROJECT_ROOT / relative if relative else None
+        return path if path and path.is_file() else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _render_pipeline():
+    st.title("Video to labelled speech corpus")
+    st.caption(
+        "Run ingestion, audio preparation, classification, segmentation, SNR, "
+        "both ASR systems, normalization, and disagreement triage."
     )
 
-    st.markdown("---")
-    st.markdown("#### 📂 Corpus Status")
-    existing_recordings = list_available_recordings()
-    st.metric("Registered Videos", len(existing_recordings))
+    with st.form("pipeline_form"):
+        source = st.text_input(
+            "Video link or local audio/video path",
+            placeholder="https://… or C:\\path\\to\\recording.mp4",
+            help="Paste a supported video URL or the full path to a local media file.",
+        )
+        notes = st.text_input(
+            "Source / permissions notes",
+            placeholder="Document permission, license, dialect, or context",
+        )
+        choice = st.radio(
+            "Transcription scope",
+            ["Transcribe every segment", "Transcribe the first N segments"],
+            horizontal=True,
+        )
+        limit = None
+        if choice == "Transcribe the first N segments":
+            limit = st.number_input(
+                "Number of segments to transcribe",
+                min_value=1,
+                max_value=10000,
+                value=10,
+                step=1,
+            )
+        submitted = st.form_submit_button(
+            "Run complete pipeline", type="primary", use_container_width=True
+        )
 
-    segments_dir = PROJECT_ROOT / "data" / "segments"
-    if segments_dir.exists():
-        seg_count = len(list(segments_dir.glob("*.wav")))
-        st.metric("Exported Segments", seg_count)
+    if submitted:
+        if not source.strip():
+            st.error("Enter a video link or local file path.")
+            return
+        with st.status("Running the corpus pipeline…", expanded=True) as status:
+            try:
+                result = run_pipeline(
+                    url=source.strip(),
+                    notes=notes.strip() or None,
+                    max_segments=None,
+                    run_snr=True,
+                    run_transcription=True,
+                    transcription_limit=int(limit) if limit is not None else None,
+                    progress_callback=status.write,
+                )
+                video_id = result["metadata"]["video_id"]
+                csv_path = rs.ensure_csv(video_id, META)
+                st.session_state["active_video"] = video_id
+                status.update(label="Pipeline complete", state="complete")
+                st.success(
+                    f"Processed **{result['metadata']['title']}**. "
+                    f"Created {len(result['segments'])} segments."
+                )
+                st.info(f"Review CSV ready: `{csv_path.name}`")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {"Stage": "Classified regions", "Result": len(result["regions"])},
+                            {"Stage": "Exported segments", "Result": len(result["segments"])},
+                            {"Stage": "Transcribed per engine", "Result": min(len(result["segments"]), int(limit)) if limit is not None else len(result["segments"])},
+                        ]
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            except Exception as exc:  # show pipeline failures in the UI
+                status.update(label="Pipeline stopped with an error", state="error")
+                st.exception(exc)
+
+
+def _render_review():
+    videos = _videos()
+    st.title("Review transcripts and segments")
+    st.caption(
+        "Listen to the audio, compare both model outputs, edit the final "
+        "annotation, and save each decision to the per-video CSV."
+    )
+    if not videos:
+        st.info("No transcript records yet. Run the pipeline first.")
+        return
+
+    with st.sidebar:
+        st.subheader("Review settings")
+        video_id = st.selectbox(
+            "Recording", videos,
+            index=videos.index(st.session_state["active_video"])
+            if st.session_state.get("active_video") in videos else 0,
+            key="review_video",
+            on_change=_reset_review_position,
+        )
+        reviewer = st.text_input(
+            "Your name (saved with changes)", key="reviewer_name"
+        ).strip()
+        shown_triage = st.multiselect(
+            "Triage groups", TRIAGE_LABELS,
+            default=["difficult", "human_choice", "review_needed"],
+            key="review_triage",
+            on_change=_reset_review_position,
+        )
+        show_status = st.radio(
+            "Review queue", ["Pending only", "All segments"],
+            key="review_status",
+            on_change=_reset_review_position,
+        )
+        order = st.selectbox(
+            "Order", ["Hardest first", "Recording order", "Random spot-check"],
+            key="review_order",
+        )
+
+    try:
+        clips = rs.load_clips(video_id, META, PROJECT_ROOT)
+    except (OSError, ValueError, KeyError) as exc:
+        st.error(f"Could not load this recording: {exc}")
+        return
+
+    decisions = rs.latest_decisions(clips)
+    counts = rs.progress(clips, decisions)
+    order_key = {
+        "Hardest first": "priority",
+        "Recording order": "recording",
+        "Random spot-check": "random",
+    }[order]
+    queue = rs.build_queue(
+        clips,
+        decisions,
+        labels=shown_triage or None,
+        statuses=("pending",) if show_status == "Pending only" else None,
+        order=order_key,
+        seed=1,
+    )
+
+    reviewed = counts["total"] - counts["pending"]
+    st.progress(reviewed / counts["total"] if counts["total"] else 0.0)
+    st.caption(
+        f"{reviewed}/{counts['total']} decided · {counts['accepted']} accepted · "
+        f"{counts['corrected']} corrected · {counts['rejected']} rejected · "
+        f"{counts['pending']} pending"
+    )
+    notice = st.session_state.pop("review_notice", None)
+    if notice:
+        st.success(notice)
+
+    output_csv = rs.csv_path(video_id, META)
+    if output_csv.exists():
+        st.download_button(
+            "Download per-video CSV",
+            data=output_csv.read_bytes(),
+            file_name=output_csv.name,
+            mime="text/csv",
+            key=f"download_{video_id}",
+        )
+
+    if not queue:
+        st.success("No segments match these filters.")
+        return
+
+    pos = min(max(st.session_state.get("review_pos", 0), 0), len(queue) - 1)
+    st.session_state["review_pos"] = pos
+    clip = queue[pos]
+    sid = clip["segment_id"]
+    st.subheader(f"Segment {pos + 1} of {len(queue)} · {sid}")
+
+    start_key, end_key = f"start_{sid}", f"end_{sid}"
+    label_key, quality_key, text_key = f"label_{sid}", f"quality_{sid}", f"final_{sid}"
+    if start_key not in st.session_state:
+        st.session_state[start_key] = float(clip.get("start_sec") or 0.0)
+    if end_key not in st.session_state:
+        st.session_state[end_key] = float(clip.get("end_sec") or 0.0)
+    if label_key not in st.session_state:
+        prior_label = clip.get("label") or clip.get("region_label") or "speech"
+        st.session_state[label_key] = prior_label if prior_label in LABELS else "speech"
+    if quality_key not in st.session_state:
+        prior_quality = clip.get("quality") or ""
+        st.session_state[quality_key] = prior_quality if prior_quality in QUALITIES else ""
+    if text_key not in st.session_state:
+        decision = decisions.get(sid)
+        st.session_state[text_key] = rs.starting_text(clip, decision)
+
+    audio_source = _source_wav(video_id)
+    if audio_source:
+        source_duration = sf.info(str(audio_source)).duration
+        bounds = st.columns(2)
+        with bounds[0]:
+            st.number_input("Start (seconds)", min_value=0.0, max_value=float(source_duration), step=0.05, key=start_key)
+        with bounds[1]:
+            st.number_input("End (seconds)", min_value=0.0, max_value=float(source_duration), step=0.05, key=end_key)
+        if st.session_state[end_key] > st.session_state[start_key]:
+            payload = _audio_bytes(audio_source, st.session_state[start_key], st.session_state[end_key])
+            if payload:
+                st.audio(payload, format="audio/wav")
+            context_start = max(0.0, st.session_state[start_key] - 2.0)
+            context_end = st.session_state[end_key] + 2.0
+            context = _audio_bytes(audio_source, context_start, context_end)
+            if context:
+                with st.expander("Listen around the segment cuts (2 seconds of context)"):
+                    st.audio(context, format="audio/wav")
     else:
-        st.metric("Exported Segments", 0)
-
-
-# ============================================================
-#  VIEW 1: INGEST & PROCESS VIDEO
-# ============================================================
-if menu_option == "🚀 Ingest & Process Video":
-    st.markdown('<div class="main-title">🚀 Video Ingestion & Pipeline Runner</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-title">Enter any YouTube URL to execute Stages 1–5: Download, 16 kHz WAV Extraction, Visualizer, VAD Classification, and Segmentation.</div>', unsafe_allow_html=True)
-
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        default_url = "https://www.youtube.com/watch?v=gK017cCH36k"
-        url_input = st.text_input(
-            "YouTube Video URL:",
-            value=default_url,
-            help="Paste any YouTube video or lecture link."
-        )
-
-        notes_input = st.text_input(
-            "Provenance Notes / Permissions:",
-            value="Recorded lecture by Dr. Mohsen Rashwan. Preserved for academic speech corpus research.",
-            help="Notes documenting source permissions and dialect/context."
-        )
-
-    with col2:
-        st.markdown("#### ⚙️ Processing Options")
-        quick_test = st.checkbox("Quick Test Mode (Limit to first 10 segments)", value=True)
-        max_segs = 10 if quick_test else None
-
-    if st.button("▶️ Run End-to-End Pipeline", type="primary", use_container_width=True):
-        if not url_input.strip():
-            st.error("Please enter a valid video URL.")
+        audio_path = Path(clip["audio_abspath"]) if clip.get("audio_abspath") else None
+        if audio_path and audio_path.is_file():
+            st.audio(audio_path.read_bytes(), format="audio/wav")
         else:
-            with st.status("Executing Pipeline Stages...", expanded=True) as status:
+            st.warning("Audio file is unavailable for this segment.")
+
+    with st.expander("Add, split, merge, or delete segments"):
+        st.caption(
+            "Structural edits and their audit history are stored in the review CSV. "
+            "WADA SNR is recalculated when source audio is available; new or "
+            "changed segments need fresh ASR transcripts."
+        )
+        if not reviewer:
+            st.info("Enter your name in Review settings to enable structural edits.")
+        split_key = f"split_point_{sid}"
+        if split_key not in st.session_state:
+            st.session_state[split_key] = (
+                st.session_state[start_key] + st.session_state[end_key]
+            ) / 2
+        st.number_input(
+            "Split this segment at (seconds)",
+            min_value=0.0,
+            step=0.05,
+            key=split_key,
+            disabled=not reviewer,
+        )
+        split_col, delete_col = st.columns(2)
+        if split_col.button("Split segment", key=f"split_{sid}", disabled=not reviewer):
+            try:
+                split_at = st.session_state[split_key]
+                child_snrs = (
+                    [_wada_snr(audio_source, st.session_state[start_key], split_at),
+                     _wada_snr(audio_source, split_at, st.session_state[end_key])]
+                    if audio_source else [None, None]
+                )
+                child_ids = rs.split_segment(video_id, sid, split_at, reviewer, META, snrs=child_snrs)
+                for child_id, (child_start, child_end), child_snr in zip(
+                    child_ids,
+                    [(st.session_state[start_key], split_at), (split_at, st.session_state[end_key])],
+                    child_snrs,
+                ):
+                    if audio_source:
+                        audio_file = _save_reviewed_audio(video_id, child_id, audio_source, child_start, child_end)
+                        rs.update_review(
+                            video_id, child_id, "pending", changed_by=reviewer,
+                            start=child_start, end=child_end, snr=child_snr,
+                            audio_file=audio_file, metadata_dir=META,
+                        )
+                st.session_state["review_notice"] = "Segment split. The original row remains marked deleted for audit."
+                st.rerun()
+            except (ValueError, KeyError, OSError) as exc:
+                st.error(str(exc))
+        if delete_col.button("Delete segment", key=f"delete_{sid}", disabled=not reviewer):
+            try:
+                rs.delete_segment(video_id, sid, reviewer, META)
+                st.session_state["review_notice"] = "Segment marked deleted; its row and change history remain in the CSV."
+                st.rerun()
+            except (ValueError, KeyError, OSError) as exc:
+                st.error(str(exc))
+
+        active_ids = [
+            c["segment_id"] for c in clips
+            if rs.status_of(decisions.get(c["segment_id"])) != "deleted"
+        ]
+        merge_choices = [candidate for candidate in active_ids if candidate != sid]
+        if merge_choices:
+            selected_merge = st.multiselect(
+                "Choose one other segment to merge with this one",
+                merge_choices,
+                max_selections=1,
+                key=f"merge_with_{sid}",
+                disabled=not reviewer,
+            )
+            if st.button(
+                "Merge selected segments",
+                key=f"merge_{sid}",
+                disabled=not reviewer or not selected_merge,
+            ):
                 try:
-                    st.write("📥 **Stage 1 & 2:** Querying metadata and preparing 16 kHz mono PCM_16 WAV...")
-                    # Run pipeline
-                    results = run_pipeline(
-                        url=url_input.strip(),
-                        notes=notes_input.strip(),
-                        max_segments=max_segs
-                    )
+                    other = next(c for c in clips if c["segment_id"] == selected_merge[0])
+                    merge_start = min(float(clip["start_sec"] or 0), float(other["start_sec"] or 0))
+                    merge_end = max(float(clip["end_sec"] or 0), float(other["end_sec"] or 0))
+                    merged_snr = _wada_snr(audio_source, merge_start, merge_end) if audio_source else None
+                    merged_id = rs.merge_segments(video_id, [sid, selected_merge[0]], reviewer, META, snr=merged_snr)
+                    if audio_source:
+                        merged_audio = _save_reviewed_audio(video_id, merged_id, audio_source, merge_start, merge_end)
+                        rs.update_review(
+                            video_id, merged_id, "pending", changed_by=reviewer,
+                            start=merge_start, end=merge_end, snr=merged_snr,
+                            audio_file=merged_audio, metadata_dir=META,
+                        )
+                    st.session_state["review_notice"] = "Segments merged. Source rows remain marked deleted for audit."
+                    st.rerun()
+                except (ValueError, KeyError, OSError) as exc:
+                    st.error(str(exc))
 
-                    st.write("🎨 **Stage 3:** Generated waveform and spectrogram inspection plots.")
-                    st.write("🧠 **Stage 4:** Classified speech, silence, music, and mixed regions.")
-                    st.write(f"✂️ **Stage 5:** Exported {len(results['segments'])} clips to `data/segments/`.")
-
-                    status.update(label="✅ Pipeline Completed Successfully!", state="complete", expanded=False)
-                    st.success(f"Processing complete for: **{results['metadata']['title']}**")
-                    st.balloons()
-                except Exception as e:
-                    status.update(label="❌ Pipeline Failed", state="error")
-                    st.error(f"Error during execution: {str(e)}")
-
-
-# ============================================================
-#  VIEW 2: BROWSE & PLAY SEGMENTS
-# ============================================================
-elif menu_option == "🎧 Browse & Play Segments":
-    st.markdown('<div class="main-title">🎧 Speech Segment Audio Browser</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-title">Listen to individual 8–12 second clips and verify word boundaries.</div>', unsafe_allow_html=True)
-
-    segments_dir = PROJECT_ROOT / "data" / "segments"
-    if not segments_dir.exists() or not list(segments_dir.glob("*.wav")):
-        st.warning("No audio segments found yet! Run the pipeline on a video first.")
-    else:
-        # Get list of segment WAV files
-        seg_files = sorted(list(segments_dir.glob("*.wav")))
-
-        # Filter controls
-        filter_col1, filter_col2 = st.columns([2, 1])
-        with filter_col1:
-            search_query = st.text_input("🔍 Search Segment ID:", placeholder="e.g. seg_000001")
-        with filter_col2:
-            st.markdown(f"**Total Clips:** `{len(seg_files)}`")
-
-        filtered_files = [f for f in seg_files if search_query.lower() in f.name.lower()]
-
-        # Display segments in a neat grid
-        for f in filtered_files:
-            info = sf.info(str(f))
-            duration = info.duration
-
-            with st.container():
-                c1, c2, c3 = st.columns([1.5, 2.5, 1])
-                with c1:
-                    st.markdown(f"**`{f.name}`**")
-                    st.caption(f"⏱️ Duration: **{duration:.2f}s** | 16 kHz Mono")
-                with c2:
-                    st.audio(str(f), format="audio/wav")
-                with c3:
-                    st.markdown('<span class="badge-verified">Auto-Verified Cut</span>', unsafe_allow_html=True)
-                st.markdown("<hr style='margin: 0.5rem 0;'>", unsafe_allow_html=True)
-
-
-# ============================================================
-#  VIEW 3: AUDIO & REGION ANALYSIS
-# ============================================================
-elif menu_option == "📊 Audio & Region Analysis":
-    st.markdown('<div class="main-title">📊 Visual Inspection & Region Statistics</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-title">Inspect waveform envelopes, STFT spectrograms, and classification coverage.</div>', unsafe_allow_html=True)
-
-    plots_dir = PROJECT_ROOT / "outputs" / "plots"
-    processed_dir = PROJECT_ROOT / "data" / "processed"
-
-    # 1. Plots Section
-    st.markdown("### 🎨 Visual Inspection Plots")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("#### 🔍 Waveform & Spectrogram Window")
-        spec_plots = list(plots_dir.glob("*_spec_*.png")) if plots_dir.exists() else []
-        if spec_plots:
-            st.image(str(spec_plots[0]), caption=spec_plots[0].name, use_container_width=True)
-        else:
-            st.info("No spectrogram plot found. Run the pipeline to generate one.")
-
-    with col2:
-        st.markdown("#### 📈 Full Amplitude Envelope")
-        env_plots = list(plots_dir.glob("*_envelope.png")) if plots_dir.exists() else []
-        if env_plots:
-            st.image(str(env_plots[0]), caption=env_plots[0].name, use_container_width=True)
-        else:
-            st.info("No envelope plot found. Run the pipeline to generate one.")
-
-    # 2. Region Breakdown Section
-    st.markdown("---")
-    st.markdown("### 🧠 4-Class Region Classifications")
-
-    region_files = list(processed_dir.glob("*_regions.json")) if processed_dir.exists() else []
-    if region_files:
-        with open(region_files[0], "r", encoding="utf-8") as rf:
-            regions_data = json.load(rf)
-
-        df = pd.DataFrame(regions_data)
-        df["duration"] = (df["end_sec"] - df["start_sec"]).round(2)
-
-        # Metrics row
-        total_dur = df["duration"].sum()
-        speech_dur = df[df["label"] == "speech"]["duration"].sum()
-        silence_dur = df[df["label"] == "silence"]["duration"].sum()
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Regions", len(df))
-        m2.metric("Total Duration", f"{total_dur/60:.1f} min")
-        m3.metric("Speech %", f"{(speech_dur/total_dur*100):.1f}%" if total_dur > 0 else "0%")
-        m4.metric("Silence %", f"{(silence_dur/total_dur*100):.1f}%" if total_dur > 0 else "0%")
-
-        st.dataframe(
-            df[["start_sec", "end_sec", "duration", "label", "confidence", "method"]],
-            use_container_width=True,
-            height=300
+        st.markdown("**Add a segment from the source audio**")
+        add_cols = st.columns(2)
+        add_start = add_cols[0].number_input(
+            "New segment start (seconds)", min_value=0.0,
+            max_value=float(source_duration) if audio_source else None, value=0.0,
+            step=0.05, key=f"add_start_{video_id}", disabled=not reviewer,
         )
-    else:
-        st.info("No classified regions JSON found yet. Run the pipeline to generate region classifications.")
+        add_end = add_cols[1].number_input(
+            "New segment end (seconds)", min_value=0.0,
+            max_value=float(source_duration) if audio_source else None, value=1.0,
+            step=0.05, key=f"add_end_{video_id}", disabled=not reviewer,
+        )
+        add_label = st.selectbox(
+            "New segment label", LABELS,
+            key=f"add_label_{video_id}", disabled=not reviewer,
+        )
+        if st.button("Add segment", key=f"add_segment_{video_id}", disabled=not reviewer):
+            try:
+                new_id = rs.add_segment(
+                    video_id, add_start, add_end, reviewer,
+                    label=add_label,
+                    snr=_wada_snr(audio_source, add_start, add_end) if audio_source else None,
+                    metadata_dir=META,
+                )
+                if audio_source:
+                    new_audio = _save_reviewed_audio(video_id, new_id, audio_source, add_start, add_end)
+                    rs.update_review(
+                        video_id, new_id, "pending", changed_by=reviewer,
+                        start=add_start, end=add_end,
+                        snr=_wada_snr(audio_source, add_start, add_end),
+                        audio_file=new_audio, metadata_dir=META,
+                    )
+                st.session_state["review_notice"] = f"Added {new_id}; it is pending transcript and SNR review."
+                st.rerun()
+            except (ValueError, KeyError, OSError) as exc:
+                st.error(str(exc))
+
+    triage = clip.get("triage_label") or "review_needed"
+    info, transcripts = st.columns([1, 2])
+    with info:
+        st.markdown(f"**Triage:** {triage}")
+        st.markdown(f"**Current review status:** {rs.status_of(decisions.get(sid))}")
+        if clip.get("wer") is not None:
+            st.caption(f"Model disagreement · WER {clip['wer']:.3f} · CER {clip.get('cer', 0):.3f}")
+        if clip.get("snr_wada_db") is not None:
+            st.caption(f"WADA SNR: {clip['snr_wada_db']:.2f} dB")
+        if clip.get("triage_reasons"):
+            st.caption("Review flags: " + ", ".join(clip["triage_reasons"]))
+    with transcripts:
+        st.markdown("**Model A · faster-whisper**")
+        st.markdown(f"<div class='rtl'>{rs.clean_text(clip.get('asr_a_text')) or '—'}</div>", unsafe_allow_html=True)
+        st.markdown(f"**Model B · {clip.get('asr_b_engine') or 'Cohere'}**")
+        st.markdown(f"<div class='rtl'>{rs.clean_text(clip.get('asr_b_text')) or '—'}</div>", unsafe_allow_html=True)
+
+    picks = st.columns(2)
+    if picks[0].button("Use Model A", key=f"use_a_{sid}", use_container_width=True):
+        st.session_state[text_key] = clip.get("asr_a_text") or ""
+        st.rerun()
+    if picks[1].button("Use Model B", key=f"use_b_{sid}", disabled=not clip.get("asr_b_text"), use_container_width=True):
+        st.session_state[text_key] = clip.get("asr_b_text") or ""
+        st.rerun()
+
+    st.markdown("#### Human annotation")
+    edit_cols = st.columns(2)
+    with edit_cols[0]:
+        st.selectbox("Segment label", LABELS, key=label_key)
+    with edit_cols[1]:
+        st.selectbox("Audio quality", QUALITIES, key=quality_key,
+                     format_func=lambda value: value or "Choose clean/noisy")
+        st.caption("Initial quality is clean at WADA SNR ≥20 dB; change it when listening shows otherwise.")
+    st.text_area("Final transcript", key=text_key, height=150)
+
+    action_cols = st.columns([2, 1, 1, 1, 1])
+    save = action_cols[0].button("Save decision & next", type="primary", key=f"save_{sid}", use_container_width=True)
+    reject = action_cols[1].button("Mark difficult", key=f"reject_{sid}", use_container_width=True)
+    back = action_cols[2].button("Previous", key=f"back_{sid}", disabled=pos == 0, use_container_width=True)
+    skip = action_cols[3].button("Skip", key=f"skip_{sid}", disabled=pos >= len(queue) - 1, use_container_width=True)
+    reopen = action_cols[4].button("Reopen", key=f"reopen_{sid}", disabled=rs.status_of(decisions.get(sid)) == "pending", use_container_width=True)
+
+    if back:
+        st.session_state["review_pos"] = max(0, pos - 1)
+        st.rerun()
+    if skip:
+        st.session_state["review_pos"] = min(len(queue) - 1, pos + 1)
+        st.rerun()
+    if save or reject or reopen:
+        if not reviewer:
+            st.error("Enter your name in Review settings before saving changes.")
+        else:
+            final_text = "" if reject else st.session_state[text_key]
+            if not reject and not rs.clean_text(final_text):
+                st.error("Final transcript cannot be empty. Use Mark difficult if it is unrecoverable.")
+            elif st.session_state[end_key] <= st.session_state[start_key]:
+                st.error("Segment end must be later than its start.")
+            else:
+                if reopen:
+                    status = "pending"
+                elif reject:
+                    status = "rejected"
+                elif rs.clean_text(final_text) in {
+                    rs.clean_text(clip.get("asr_a_text")),
+                    rs.clean_text(clip.get("asr_b_text")),
+                }:
+                    status = "accepted"
+                else:
+                    status = "corrected"
+                try:
+                    bounds_changed = (
+                        abs(st.session_state[start_key] - float(clip.get("start_sec") or 0.0)) > 0.001
+                        or abs(st.session_state[end_key] - float(clip.get("end_sec") or 0.0)) > 0.001
+                    )
+                    audio_file = clip.get("audio_path") or ""
+                    if audio_source and bounds_changed:
+                        audio_file = _save_reviewed_audio(
+                            video_id, sid, audio_source,
+                            st.session_state[start_key], st.session_state[end_key],
+                        )
+                    rs.update_review(
+                        video_id=video_id,
+                        segment_id=sid,
+                        status=status,
+                        final_transcript=final_text,
+                        label=st.session_state[label_key],
+                        quality=st.session_state[quality_key],
+                        changed_by=reviewer,
+                        start=st.session_state[start_key],
+                        end=st.session_state[end_key],
+                        snr=(
+                            _wada_snr(audio_source, st.session_state[start_key], st.session_state[end_key])
+                            if audio_source else None
+                        ),
+                        audio_file=audio_file,
+                        metadata_dir=META,
+                    )
+                    if not (show_status == "All segments" and reopen):
+                        st.session_state["review_pos"] = min(pos + 1, len(queue) - 1)
+                    st.session_state["review_notice"] = f"Saved {status} for {sid}; change history is in the CSV."
+                    st.rerun()
+                except (ValueError, KeyError, OSError) as exc:
+                    st.error(str(exc))
+
+
+def _render_segments():
+    st.title("Browse segments")
+    videos = _videos()
+    if not videos:
+        st.info("No transcribed recordings yet.")
+        return
+    video_id = st.selectbox("Recording", videos, key="browse_video")
+    try:
+        clips = rs.load_clips(video_id, META, PROJECT_ROOT)
+    except (OSError, ValueError, KeyError) as exc:
+        st.error(str(exc))
+        return
+    query = st.text_input("Filter by segment ID")
+    rows = [
+        {
+            "segment_id": c["segment_id"],
+            "start": c.get("start"),
+            "end": c.get("end"),
+            "label": c.get("label") or c.get("region_label"),
+            "status": c.get("status"),
+            "Model A": c.get("asr_a_text"),
+            "Model B": c.get("asr_b_text"),
+            "Final": c.get("final_transcript"),
+        }
+        for c in clips if query.casefold() in c["segment_id"].casefold()
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    csv_file = rs.csv_path(video_id, META)
+    if csv_file.exists():
+        st.download_button("Download CSV", csv_file.read_bytes(), csv_file.name, "text/csv")
+
+
+def _render_analysis():
+    st.title("Audio and region analysis")
+    plots_dir = PROJECT_ROOT / "outputs" / "plots"
+    regions_dir = PROJECT_ROOT / "data" / "processed"
+    region_files = sorted(regions_dir.glob("*_regions.json")) if regions_dir.exists() else []
+    if not region_files:
+        st.info("Run the pipeline to generate spectrograms and classified regions.")
+        return
+
+    path = st.selectbox(
+        "Classified recording",
+        region_files,
+        format_func=lambda value: value.name.removesuffix("_regions.json"),
+    )
+    video_id = path.name.removesuffix("_regions.json")
+    try:
+        regions = json.loads(path.read_text(encoding="utf-8"))
+        if not regions:
+            st.info("No regions were classified for this recording.")
+            return
+
+        audio_source = _source_wav(video_id)
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Spectrogram and region labels")
+            if audio_source:
+                audio_duration = sf.info(str(audio_source)).duration
+                preview_start = st.number_input(
+                    "Preview start (seconds)", min_value=0.0,
+                    max_value=max(0.0, float(audio_duration) - 1.0),
+                    value=min(60.0, max(0.0, float(audio_duration) - 10.0)),
+                    step=1.0,
+                    key=f"region_preview_start_{video_id}",
+                )
+                figure = _region_spectrogram(audio_source, regions, preview_start)
+                if figure is not None:
+                    st.pyplot(figure, use_container_width=True)
+                    plt.close(figure)
+            else:
+                st.info("Source audio is unavailable for this recording.")
+        with right:
+            st.subheader("Amplitude envelope")
+            envelopes = sorted(plots_dir.glob(f"*{video_id}*_envelope.png")) if plots_dir.exists() else []
+            if envelopes:
+                st.image(str(envelopes[-1]), caption=envelopes[-1].name, use_container_width=True)
+            else:
+                st.info("No envelope plot is available for this recording.")
+
+        st.markdown("#### Correct region labels and boundaries")
+        st.caption("Changes update the saved region manifest and an append-only region audit CSV. Existing segment audio is not regenerated by this editor.")
+        editable = pd.DataFrame([
+            {"start_sec": row.get("start_sec", 0.0),
+             "end_sec": row.get("end_sec", 0.0),
+             "label": row.get("label", "mixed")}
+            for row in regions
+        ])
+        changed = st.data_editor(
+            editable,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            key=f"regions_editor_{video_id}",
+            column_config={
+                "start_sec": st.column_config.NumberColumn("Start (s)", min_value=0.0, step=0.05, format="%.3f"),
+                "end_sec": st.column_config.NumberColumn("End (s)", min_value=0.0, step=0.05, format="%.3f"),
+                "label": st.column_config.SelectboxColumn("Region label", options=["speech", "silence", "music", "mixed"], required=True),
+            },
+        )
+        editor_reviewer = st.text_input("Your name (region audit)", key="region_reviewer").strip()
+        if st.button("Save region corrections", key=f"save_regions_{video_id}", type="primary"):
+            if not editor_reviewer:
+                st.error("Enter your name so region changes are attributable.")
+                return
+            updated = []
+            events = []
+            previous_end = -1.0
+            duration = sf.info(str(audio_source)).duration if audio_source else None
+            for index, row in enumerate(changed.to_dict("records")):
+                start, end = float(row["start_sec"]), float(row["end_sec"])
+                label = str(row["label"])
+                if start < 0 or end <= start or start < previous_end:
+                    st.error("Region times must be valid, ordered, and non-overlapping.")
+                    return
+                if duration is not None and end > duration:
+                    st.error("A region boundary extends past the source audio duration.")
+                    return
+                previous_end = end
+                original = regions[index]
+                revised = dict(original)
+                revised.update({"start_sec": round(start, 3), "end_sec": round(end, 3), "label": label})
+                updated.append(revised)
+                if (float(original.get("start_sec", 0)) != start
+                        or float(original.get("end_sec", 0)) != end
+                        or original.get("label") != label):
+                    stamp = datetime.now(timezone.utc).isoformat()
+                    event = {
+                        "changed_at": stamp,
+                        "changed_by": editor_reviewer,
+                        "video_id": video_id,
+                        "region_index": index,
+                        "before_start": original.get("start_sec", ""),
+                        "before_end": original.get("end_sec", ""),
+                        "before_label": original.get("label", ""),
+                        "after_start": round(start, 3),
+                        "after_end": round(end, 3),
+                        "after_label": label,
+                    }
+                    revised.setdefault("human_changes", []).append(event)
+                    events.append(event)
+            if not events:
+                st.info("No region values changed.")
+                return
+            try:
+                audit_path = META / f"{video_id}_region_changes.csv"
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+                fields = list(events[0])
+                is_new = not audit_path.exists()
+                with audit_path.open("a", encoding="utf-8", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+                    if is_new:
+                        writer.writeheader()
+                    writer.writerows(events)
+                temporary = path.with_name(path.name + ".tmp")
+                temporary.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary.replace(path)
+                updated_segments = 0
+                if rs.csv_path(video_id, META).exists():
+                    clips = rs.load_clips(video_id, META, PROJECT_ROOT)
+                    for clip in clips:
+                        if rs.status_of(clip) == "deleted":
+                            continue
+                        midpoint = ((clip.get("start_sec") or 0) + (clip.get("end_sec") or 0)) / 2
+                        matching = next((r for r in updated if r["start_sec"] <= midpoint < r["end_sec"]), None)
+                        if not matching or matching.get("label") not in LABELS:
+                            continue
+                        if clip.get("label") == matching.get("label"):
+                            continue
+                        rs.update_review(
+                            video_id=video_id,
+                            segment_id=clip["segment_id"],
+                            status=rs.status_of(clip),
+                            final_transcript=clip.get("final_transcript"),
+                            label=matching["label"],
+                            quality=clip.get("quality"),
+                            changed_by=editor_reviewer,
+                            start=clip.get("start_sec"),
+                            end=clip.get("end_sec"),
+                            snr=clip.get("snr_wada_db"),
+                            audio_file=clip.get("audio_path") or "",
+                            metadata_dir=META,
+                        )
+                        updated_segments += 1
+                st.session_state["region_notice"] = (
+                    f"Saved {len(events)} region change(s) and appended the CSV audit. "
+                    f"Updated {updated_segments} overlapping segment label(s) in the review CSV."
+                )
+                st.rerun()
+            except OSError as exc:
+                st.error(f"Could not save region corrections: {exc}")
+        notice = st.session_state.pop("region_notice", None)
+        if notice:
+            st.success(notice)
+        full_frame = pd.DataFrame(regions)
+        if not full_frame.empty:
+            full_frame["duration_sec"] = (full_frame["end_sec"] - full_frame["start_sec"]).round(3)
+            with st.expander("Classifier confidence and method"):
+                columns = [c for c in ("start_sec", "end_sec", "duration_sec", "label", "confidence", "method") if c in full_frame]
+                st.dataframe(full_frame[columns], use_container_width=True, hide_index=True)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        st.error(f"Could not read or edit region records: {exc}")
+
+
+with st.sidebar:
+    st.title("🎙️ Corpus Studio")
+    page = st.radio(
+        "Workspace",
+        ["Run pipeline", "Review and export", "Browse segments", "Audio analysis"],
+        label_visibility="collapsed",
+    )
+    st.divider()
+    st.metric("Videos with transcripts", len(_videos()))
+    segment_dir = PROJECT_ROOT / "data" / "segments"
+    st.metric("Segment audio files", len(list(segment_dir.glob("*.wav"))) if segment_dir.exists() else 0)
+
+if page == "Run pipeline":
+    _render_pipeline()
+elif page == "Review and export":
+    _render_review()
+elif page == "Browse segments":
+    _render_segments()
+else:
+    _render_analysis()

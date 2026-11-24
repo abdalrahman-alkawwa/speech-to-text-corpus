@@ -156,7 +156,7 @@ def _archive_stale_outputs(
     metadata_dir: Path = METADATA_DIR,
 ) -> list:
     """
-    Archive old SNR and transcript outputs.
+    Archive old SNR, transcript, and review outputs.
 
     Stage 5 may recreate and renumber audio clips.
 
@@ -173,6 +173,7 @@ def _archive_stale_outputs(
     for suffix in (
         "_snr.json",
         "_transcripts.json",
+        "_review.csv",
     ):
 
         path = Path(metadata_dir) / f"{video_id}{suffix}"
@@ -180,7 +181,7 @@ def _archive_stale_outputs(
         if path.exists():
 
             target = path.with_name(
-                f"{path.stem}.stale_{stamp}.json"
+                f"{path.stem}.stale_{stamp}{path.suffix}"
             )
 
             path.rename(target)
@@ -289,6 +290,8 @@ def run_pipeline(
     max_segments: int = None,
     run_snr: bool = True,
     run_transcription: bool = False,
+    transcription_limit: int = None,
+    progress_callback=None,
 ) -> dict:
     """
     Execute the complete Arabic speech corpus pipeline.
@@ -310,6 +313,13 @@ def run_pipeline(
     run_transcription:
         Run Stages 7, 8 and 9 if True.
 
+    transcription_limit:
+        Optional maximum number of newly exported segments to send through
+        both ASR engines. Segmentation still exports the full requested set.
+
+    progress_callback:
+        Optional callable receiving a short message before each pipeline stage.
+
     Returns
     -------
     Dictionary containing generated pipeline assets.
@@ -321,6 +331,10 @@ def run_pipeline(
 
     kind, source = resolve_source(url)
 
+    def report_stage(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
     # ========================================================
     # STAGE 1 & 2: INGESTION AND EXTRACTION
     # ========================================================
@@ -329,6 +343,7 @@ def run_pipeline(
         ">>> STAGE 1 & 2: INGESTION, EXTRACTION, AND VALIDATION"
         + (" (LOCAL FILE)" if kind == "file" else " (LINK)")
     )
+    report_stage("Stage 1/2 · ingesting source and preparing validated audio")
 
     if kind == "url":
 
@@ -361,6 +376,7 @@ def run_pipeline(
     # ========================================================
 
     _banner(">>> STAGE 3: AUDIO VISUALIZATION")
+    report_stage("Stage 3/9 · generating waveform and spectrogram previews")
 
     slice_start = (
         60.0 if total_duration > 70.0 else 0.0
@@ -387,6 +403,7 @@ def run_pipeline(
         ">>> STAGE 4: REGION CLASSIFICATION "
         "(Speech / Silence / Music / Mixed)"
     )
+    report_stage("Stage 4/9 · classifying speech, silence, music, and mixed regions")
 
     regions_file = (
         wav_path.parent / f"{video_id}_regions.json"
@@ -404,6 +421,7 @@ def run_pipeline(
     _banner(
         ">>> STAGE 5: SPEECH SEGMENTATION (5-15s CLIPS)"
     )
+    report_stage("Stage 5/9 · segmenting speech and mixed regions at pauses")
 
     segments = export_segments(
         wav_path=wav_path,
@@ -444,6 +462,7 @@ def run_pipeline(
             ">>> STAGE 6: SIGNAL-TO-NOISE RATIO "
             "(WADA + FRAME ENERGY)"
         )
+        report_stage("Stage 6/9 · estimating SNR for every exported segment")
 
         snr_records = compute_snr_for_video(
             video_id
@@ -528,6 +547,7 @@ def run_pipeline(
                 ">>> STAGE 7: ASR TRANSCRIPTION "
                 "(WHISPER + COHERE)"
             )
+            report_stage("Stage 7/9 · transcribing the selected segments with both ASR engines")
 
             print(
                 "[pipeline] Starting both transcription engines."
@@ -566,6 +586,7 @@ def run_pipeline(
             transcriber.run_engines(
                 video_ids=[video_id],
                 engines="both",
+                limit=transcription_limit,
                 force=False,
             )
 
@@ -588,6 +609,7 @@ def run_pipeline(
             _banner(
                 ">>> STAGE 8: ARABIC TRANSCRIPT NORMALIZATION"
             )
+            report_stage("Stage 8/9 · normalizing Arabic transcripts for comparison")
 
             print(
                 "[pipeline] Normalizing Engine A and Engine B transcripts."
@@ -608,6 +630,7 @@ def run_pipeline(
             _banner(
                 ">>> STAGE 9: ASR EVALUATION AND HUMAN-REVIEW TRIAGE"
             )
+            report_stage("Stage 9/9 · comparing transcripts and assigning review triage")
 
             print(
                 "[pipeline] Calculating WER, CER and triage labels."

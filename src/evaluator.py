@@ -1,28 +1,51 @@
-
 """
-Arabic Speech Corpus — Transcript Evaluator
-============================================
+src/evaluator.py
+================
+Stage 9: How much do the two engines disagree?  (symmetric, length-aware) and triage.
 
-Stage 9: Compare the two ASR transcripts using Stage 8 normalized text.
+The rule from the project brief, made length-aware
+--------------------------------------------------
+    Both transcripts agree            identical after normalization, or CER <= 2%   -> accepted
+    Different in a few words          the annotator listens and chooses A, B or corrects -> review_needed
+    Very different                    many words differ                              -> difficult
 
-Decision rules:
-1. Both normalized transcripts identical -> accepted.
-2. Character Error Rate (CER) <= 2% -> accepted.
-3. Relative word edit rate <= configured threshold -> human_choice.
-4. Otherwise -> difficult.
+"A few words" is not a fixed 3.  It scales with the clip: up to `few_ratio` of the words
+(default 15%), but at least `min_words` and at most `max_words`:
 
-Relative word edit rate:
-    word edits / max(number of words in A, number of words in B)
+        allowed = min(max_words, max(min_words, ceil(few_ratio * words_in_clip)))
 
-The default human-choice threshold is 10%.
-It can be changed from the command line.
+    10-word clip -> 2 words    25-word clip -> 4 words    60-word clip -> 6 words (the cap)
 
-Important:
-- The normalized fields from normalizer.py are used.
-- Raw ASR transcripts are never modified.
-- Engine A is used as the WER/CER reference by convention only.
-  It is NOT treated as ground truth.
-- SNR and audio quality do not change the transcript-agreement decision.
+How "different words" is counted
+--------------------------------
+* SYMMETRIC: the number of word edits (substitutions + insertions + deletions) between the
+  two transcripts, relative to the LONGER of the two.  Neither engine is the reference.
+* TOLERANT of spelling: Egyptian Arabic has no standard spelling, so two words that are
+  almost the same (at most `near_ratio` of their letters differ, words of 5+ letters) count
+  as the same word.  Set --near-ratio 0 to require exact words.
+* CER is symmetric too (character edits / the longer text).
+
+A clip is NOT accepted, even when the engines agree, if a warning sign is present (agreement
+is not proof).  Warning signs: region "mixed"/"music", a flagged cut, engine B text missing,
+Latin letters / digits left in engine A's text, Whisper compression_ratio > 2.4 or
+avg_logprob < -1.0, WADA SNR below min_snr_db.  Engine A text empty or Whisper
+no_speech_prob > 0.6 makes a clip "difficult".
+
+All numbers are starting values to TUNE: the summary shows how the labels would change under
+other settings, and src/engine_report.py measures how accurate the "accepted" clips really are
+once you have reviewed some clips.
+
+Output
+------
+Adds to each record in metadata/<video_id>_transcripts.json:
+    diff_words, diff_words_strict, n_words_max, diff_ratio, allowed_diff_words, cer_sym,
+    wer, cer (engine A as reference - informational only), triage_label, triage_reasons,
+    triage_version
+and writes metadata/<video_id>_triage_summary.json.  Raw and normalized texts are never changed.
+
+Usage (PowerShell, repository root):
+    python src/evaluator.py --video-id CvrNaPFIwcQ
+    python src/evaluator.py --few-ratio 0.25 --max-words 8 --near-ratio 0.2
 """
 
 import argparse
@@ -30,623 +53,360 @@ import json
 import math
 import os
 import statistics
-import tempfile
-from collections import Counter
+import sys
+from dataclasses import dataclass, asdict
+from functools import lru_cache
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-try:
-    import jiwer
-except ImportError:
-    jiwer = None
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.normalizer import normalize_with_flags
 
-# ---------------------------------------------------------
-# Paths and configuration
-# ---------------------------------------------------------
+METADATA_DIR = PROJECT_ROOT / "metadata"
+TRIAGE_VERSION = "triage_v3_waw_spacing"
+MIN_NEAR_LENGTH = 5                      # words shorter than this must match exactly
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-try:
-    from config import METADATA_DIR
-    METADATA_DIR = Path(METADATA_DIR)
-except ImportError:
-    try:
-        from src.config import METADATA_DIR
-        METADATA_DIR = Path(METADATA_DIR)
-    except ImportError:
-        METADATA_DIR = PROJECT_ROOT / "metadata"
+try:                                    # optional dependency
+    import jiwer as _jiwer
+except ImportError:                     # pragma: no cover - exercised only without jiwer
+    _jiwer = None
 
 
-TRIAGE_VERSION = "triage_v3"
-
-CER_ACCEPTANCE_THRESHOLD = 0.02
-
-# Initial tunable threshold:
-# If relative word disagreement is <= 10%, send to human choice.
-HUMAN_CHOICE_MAX_EDIT_RATE = 0.10
-
-
-# ---------------------------------------------------------
-# Normalization access
-# ---------------------------------------------------------
-
-def get_normalized_text(record, field):
-    """
-    Read the normalized transcript created by Stage 8.
-
-    Expected fields:
-        asr_a_text_norm
-        asr_b_text_norm
-
-    Only fall back to normalizing the raw text if the
-    normalized field is missing or unusable.
-    """
-
-    normalized_field = f"{field}_norm"
-    normalized = record.get(normalized_field)
-
-    if isinstance(normalized, str):
-        if normalized.strip():
-            return normalized.strip()
-
-        # An empty normalized string is valid if the raw
-        # transcript is also empty.
-        raw = record.get(field) or ""
-        if not raw.strip():
-            return ""
-
-    raw = record.get(field) or ""
-
-    if not raw.strip():
-        return ""
-
-    # Fallback only. The normal pipeline should already
-    # have produced the normalized field in Stage 8.
-    try:
-        from normalizer import normalize_arabic
-    except ImportError:
-        from src.normalizer import normalize_arabic
-
-    return normalize_arabic(raw) or ""
+@dataclass
+class TriageConfig:
+    agree_cer: float = 0.02              # CER at or below this = "the engines agree"
+    few_ratio: float = 0.15              # a few words = up to this share of the clip's words...
+    min_words: int = 1                   # ...but always allow at least this many
+    max_words: int = 6                   # ...and never more than this many
+    near_ratio: float = 0.20             # words this close in spelling count as equal (0 = exact only)
+    max_compression_ratio: float = 2.4   # Whisper repetition-loop warning
+    min_avg_logprob: float = -1.0        # Whisper "unsure" warning
+    max_no_speech_prob: float = 0.6      # Whisper "probably not speech"
+    min_snr_db: Optional[float] = 10.0   # WADA SNR below this -> review (None disables)
 
 
-# ---------------------------------------------------------
-# Word-level edit counting
-# ---------------------------------------------------------
-
-def fallback_word_edit_counts(reference, hypothesis):
-    """
-    Calculate word-level substitutions, deletions and
-    insertions using dynamic programming.
-
-    Used only if jiwer is unavailable.
-    """
-
-    ref = reference.split()
-    hyp = hypothesis.split()
-
-    rows = len(ref) + 1
-    cols = len(hyp) + 1
-
-    # Each cell stores:
-    # (total_cost, substitutions, deletions, insertions)
-    dp = [[None] * cols for _ in range(rows)]
-
-    dp[0][0] = (0, 0, 0, 0)
-
-    for i in range(1, rows):
-        dp[i][0] = (i, 0, i, 0)
-
-    for j in range(1, cols):
-        dp[0][j] = (j, 0, 0, j)
-
-    for i in range(1, rows):
-        for j in range(1, cols):
-
-            if ref[i - 1] == hyp[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1]
-                continue
-
-            previous = dp[i - 1][j - 1]
-            substitution = (
-                previous[0] + 1,
-                previous[1] + 1,
-                previous[2],
-                previous[3],
-            )
-
-            previous = dp[i - 1][j]
-            deletion = (
-                previous[0] + 1,
-                previous[1],
-                previous[2] + 1,
-                previous[3],
-            )
-
-            previous = dp[i][j - 1]
-            insertion = (
-                previous[0] + 1,
-                previous[1],
-                previous[2],
-                previous[3] + 1,
-            )
-
-            dp[i][j] = min(
-                substitution,
-                deletion,
-                insertion,
-                key=lambda item: item[0],
-            )
-
-    _, substitutions, deletions, insertions = dp[-1][-1]
-
-    return substitutions, deletions, insertions
+def allowed_words(n_words: int, cfg: TriageConfig) -> int:
+    """How many differing words still count as 'a few' for a clip of this many words."""
+    scaled = math.ceil(round(cfg.few_ratio * n_words, 9))
+    return min(cfg.max_words, max(cfg.min_words, scaled))
 
 
-def count_word_edits(reference, hypothesis):
-    """Return substitutions, deletions, insertions and total edits."""
-
-    if jiwer is not None:
-        result = jiwer.process_words(reference, hypothesis)
-
-        substitutions = result.substitutions
-        deletions = result.deletions
-        insertions = result.insertions
-    else:
-        substitutions, deletions, insertions = (
-            fallback_word_edit_counts(reference, hypothesis)
-        )
-
-    total = substitutions + deletions + insertions
-
-    return {
-        "substitutions": substitutions,
-        "deletions": deletions,
-        "insertions": insertions,
-        "total": total,
-    }
-
-
-# ---------------------------------------------------------
-# WER and CER
-# ---------------------------------------------------------
-
-def levenshtein_distance(reference, hypothesis):
-    """Basic character-level Levenshtein distance."""
-
-    previous = list(range(len(hypothesis) + 1))
-
-    for i, ref_char in enumerate(reference, start=1):
+# --------------------------------------------------------------------------- #
+# Edit distances
+# --------------------------------------------------------------------------- #
+def _edit_distance(a: Sequence, b: Sequence) -> int:
+    """Levenshtein distance (substitution, insertion, deletion all cost 1)."""
+    previous = list(range(len(b) + 1))
+    for i, x in enumerate(a, start=1):
         current = [i]
-
-        for j, hyp_char in enumerate(hypothesis, start=1):
-            cost = 0 if ref_char == hyp_char else 1
-
-            current.append(
-                min(
-                    previous[j] + 1,
-                    current[j - 1] + 1,
-                    previous[j - 1] + cost,
-                )
-            )
-
+        for j, y in enumerate(b, start=1):
+            current.append(min(previous[j] + 1,              # deletion
+                               current[j - 1] + 1,           # insertion
+                               previous[j - 1] + (x != y)))  # substitution / match
         previous = current
-
     return previous[-1]
 
 
-def compute_wer_cer(reference, hypothesis):
-    """
-    Calculate WER and CER.
+@lru_cache(maxsize=None)
+def words_near(a: str, b: str, near_ratio: float) -> bool:
+    """Same word, allowing a small spelling difference (words of 5+ letters only)."""
+    if a == b:
+        return True
+    if near_ratio <= 0 or min(len(a), len(b)) < MIN_NEAR_LENGTH:
+        return False
+    return _edit_distance(a, b) / max(len(a), len(b)) <= near_ratio
 
-    Engine A is the reference for metric calculation.
-    This is a calculation convention, not a claim that
-    Engine A is correct.
-    """
 
-    reference = " ".join((reference or "").split())
-    hypothesis = " ".join((hypothesis or "").split())
+def word_difference(words_a: Sequence[str], words_b: Sequence[str], near_ratio: float = 0.0) -> int:
+    """Word-level edit distance in which a substitution between 'near' words is free."""
+    previous = list(range(len(words_b) + 1))
+    for i, x in enumerate(words_a, start=1):
+        current = [i]
+        for j, y in enumerate(words_b, start=1):
+            substitution = 0 if words_near(x, y, near_ratio) else 1
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + substitution))
+        previous = current
+    return previous[-1]
 
-    if not reference:
+
+def compare_texts(text_a: str, text_b: str, near_ratio: float = 0.0) -> Dict[str, Any]:
+    """Symmetric comparison of two normalized transcripts."""
+    words_a, words_b = text_a.split(), text_b.split()
+    n_max = max(len(words_a), len(words_b))
+    if n_max == 0:
+        return {"n_words_max": 0, "diff_words": 0, "diff_words_strict": 0, "diff_ratio": 0.0, "cer_sym": 0.0}
+    strict = word_difference(words_a, words_b, 0.0)
+    soft = strict if near_ratio <= 0 else word_difference(words_a, words_b, near_ratio)
+    chars = max(len(text_a), len(text_b))
+    return {
+        "n_words_max": n_max,
+        "diff_words": soft,
+        "diff_words_strict": strict,
+        "diff_ratio": soft / n_max,
+        "cer_sym": _edit_distance(text_a, text_b) / chars,
+    }
+
+
+def compute_wer_cer(ref: Optional[str], hyp: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+    """Classic WER/CER of hyp against ref (ref = engine A).  Informational only."""
+    ref = " ".join((ref or "").split())
+    hyp = " ".join((hyp or "").split())
+    if not ref:
         return None, None
-
-    if jiwer is not None:
-        wer = jiwer.wer(reference, hypothesis)
-        cer = jiwer.cer(reference, hypothesis)
-    else:
-        ref_words = reference.split()
-        hyp_words = hypothesis.split()
-
-        word_edits = count_word_edits(reference, hypothesis)["total"]
-        wer = word_edits / len(ref_words)
-
-        char_edits = levenshtein_distance(reference, hypothesis)
-        cer = char_edits / len(reference)
-
-    return wer, cer
+    if _jiwer is not None:
+        return float(_jiwer.wer(ref, hyp)), float(_jiwer.cer(ref, hyp))
+    return _edit_distance(ref.split(), hyp.split()) / len(ref.split()), _edit_distance(ref, hyp) / len(ref)
 
 
-# ---------------------------------------------------------
-# Evaluate one segment
-# ---------------------------------------------------------
+def canonicalize_arabic_waw_spacing(text: Optional[str]) -> Optional[str]:
+    """Join a standalone Arabic conjunction و to the following word for comparison.
 
-def triage_clip(record, human_choice_max_edit_rate=None):
+    ASR systems differ in whether they emit the conjunction attached ("ومصر")
+    or as a separate token ("و مصر"). This comparison-only rule gives both
+    spellings one form without changing either saved raw transcript.
     """
-    Compare the normalized transcripts of one segment.
-    """
+    if text is None:
+        return None
+    words = text.split()
+    canonical = []
+    index = 0
+    while index < len(words):
+        next_is_arabic = (
+            index + 1 < len(words)
+            and words[index + 1]
+            and "\u0600" <= words[index + 1][0] <= "\u06ff"
+        )
+        if words[index] == "و" and next_is_arabic:
+            canonical.append("و" + words[index + 1])
+            index += 2
+        else:
+            canonical.append(words[index])
+            index += 1
+    return " ".join(canonical)
 
-    if human_choice_max_edit_rate is None:
-        human_choice_max_edit_rate = HUMAN_CHOICE_MAX_EDIT_RATE
 
-    text_a = get_normalized_text(record, "asr_a_text")
-    text_b = get_normalized_text(record, "asr_b_text")
+# --------------------------------------------------------------------------- #
+# Triage
+# --------------------------------------------------------------------------- #
+def agreement_label(diff_words: int, cer_sym: float, n_words: int, cfg: TriageConfig) -> str:
+    """accepted / review_needed / difficult from the disagreement alone."""
+    if diff_words == 0 or cer_sym <= cfg.agree_cer:
+        return "accepted"
+    return "review_needed" if diff_words <= allowed_words(n_words, cfg) else "difficult"
 
-    words_a = text_a.split()
-    words_b = text_b.split()
 
-    word_count_a = len(words_a)
-    word_count_b = len(words_b)
+def triage_clip(
+    rec: Dict[str, Any],
+    cfg: TriageConfig,
+    region_label: Optional[str] = None,
+    boundary_check: Optional[str] = None,
+    snr_wada_db: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Score one clip: the disagreement metrics, a triage label and the reasons for it."""
+    # Always normalize from the RAW text.  Stored *_text_norm fields can be stale (for example
+    # after engine B was re-run), and normalizing is instant and deterministic anyway.
+    raw_a = rec.get("asr_a_text")
+    raw_b = rec.get("asr_b_text")
+    text_a, flags_a = normalize_with_flags(raw_a if raw_a is not None else rec.get("asr_a_text_norm"))
+    text_b, _ = normalize_with_flags(raw_b if raw_b is not None else rec.get("asr_b_text_norm"))
+    text_a = canonicalize_arabic_waw_spacing(text_a)
+    text_b = canonicalize_arabic_waw_spacing(text_b)
 
-    # Use the longer transcript as the denominator.
-    comparison_word_count = max(word_count_a, word_count_b)
+    difficult: List[str] = []
+    review: List[str] = []
+    result: Dict[str, Any] = {"asr_a_eval_text": text_a, "asr_b_eval_text": text_b,
+                              "n_words_max": None, "diff_words": None, "diff_words_strict": None,
+                              "diff_ratio": None, "allowed_diff_words": None, "cer_sym": None,
+                              "wer": None, "cer": None}
 
-    edits = count_word_edits(text_a, text_b)
-
-    word_edit_rate = (
-        edits["total"] / comparison_word_count
-        if comparison_word_count > 0
-        else None
-    )
-
-    wer, cer = compute_wer_cer(text_a, text_b)
-
-    reasons = []
-
-    # Missing transcript: comparison cannot be trusted.
+    # --- Whisper's own warning signs ---
     if not text_a:
-        label = "difficult"
-        reasons.append("engine_a_empty")
+        difficult.append("engine_a_empty")
+    no_speech = rec.get("asr_a_no_speech_prob")
+    if no_speech is not None and no_speech > cfg.max_no_speech_prob:
+        difficult.append("no_speech_prob_high")
+    compression = rec.get("asr_a_compression_ratio")
+    if compression is not None and compression > cfg.max_compression_ratio:
+        review.append("compression_ratio_high")
+    logprob = rec.get("asr_a_avg_logprob")
+    if logprob is not None and logprob < cfg.min_avg_logprob:
+        review.append("avg_logprob_low")
 
-    elif not text_b:
-        label = "difficult"
-        reasons.append("engine_b_empty")
+    # --- agreement between the engines ---
+    if text_b is None:
+        review.append("engine_b_missing")
+    elif text_a:
+        metrics = compare_texts(text_a, text_b, cfg.near_ratio)
+        allowed = allowed_words(metrics["n_words_max"], cfg)
+        wer, cer = compute_wer_cer(text_a, text_b)
+        result.update({**metrics, "allowed_diff_words": allowed,
+                       "diff_ratio": round(metrics["diff_ratio"], 4), "cer_sym": round(metrics["cer_sym"], 4),
+                       "wer": None if wer is None else round(wer, 4),
+                       "cer": None if cer is None else round(cer, 4)})
+        verdict = agreement_label(metrics["diff_words"], metrics["cer_sym"], metrics["n_words_max"], cfg)
+        if verdict == "difficult":
+            difficult.append("many_words_differ")
+        elif verdict == "review_needed":
+            review.append("few_words_differ")
 
-    # Both transcripts are identical after normalization.
-    elif text_a == text_b:
-        label = "accepted"
-        reasons.append("identical_normalized_text")
+    # --- context: where the clip came from ---
+    if region_label in ("mixed", "music"):
+        review.append(f"region_{region_label}")
+    if boundary_check == "flagged_manual_review":
+        review.append("boundary_flagged")
+    if snr_wada_db is not None and cfg.min_snr_db is not None and snr_wada_db < cfg.min_snr_db:
+        review.append("low_snr")
+    # Flags describe engine A's text, the one reviewers start from.  Engine B may use another
+    # convention (for example English words in Latin letters); that already shows up in the difference.
+    for flag in sorted(set(flags_a)):
+        if flag != "empty":
+            review.append(f"norm_{flag}")
 
-    # CER acceptance rule from the project specification.
-    elif cer is not None and cer <= CER_ACCEPTANCE_THRESHOLD:
-        label = "accepted"
-        reasons.append("cer_at_or_below_2_percent")
-
-    # Relative disagreement determines whether the
-    # annotator should choose between the transcripts.
-    elif (
-        word_edit_rate is not None
-        and word_edit_rate <= human_choice_max_edit_rate
-    ):
-        label = "human_choice"
-        reasons.append("relative_word_edit_rate_within_threshold")
-
-    else:
-        label = "difficult"
-        reasons.append("relative_word_edit_rate_above_threshold")
-
-    return {
-        "asr_a_eval_text": text_a,
-        "asr_b_eval_text": text_b,
-
-        "word_count_a": word_count_a,
-        "word_count_b": word_count_b,
-        "comparison_word_count": comparison_word_count,
-
-        "wer": round(wer, 4) if wer is not None else None,
-        "cer": round(cer, 4) if cer is not None else None,
-
-        "word_substitutions": edits["substitutions"],
-        "word_deletions": edits["deletions"],
-        "word_insertions": edits["insertions"],
-        "word_edit_count": edits["total"],
-
-        "word_edit_rate": (
-            round(word_edit_rate, 4)
-            if word_edit_rate is not None
-            else None
-        ),
-
-        "human_choice_max_edit_rate": human_choice_max_edit_rate,
-
-        "triage_label": label,
-        "automatic_status": label,
-        "triage_reasons": reasons,
-    }
+    label = "difficult" if difficult else ("review_needed" if review else "accepted")
+    result.update({"triage_label": label, "triage_reasons": difficult + review})
+    return result
 
 
-# ---------------------------------------------------------
-# Summary statistics
-# ---------------------------------------------------------
+def summarize(records: List[Dict[str, Any]], cfg: TriageConfig) -> Dict[str, Any]:
+    """Counts per label, the disagreement distribution, and how the labels change under other settings."""
+    labels = [r["triage_label"] for r in records]
+    ratios = sorted(r["diff_ratio"] for r in records if r.get("diff_ratio") is not None)
+    reasons: Dict[str, int] = {}
+    for r in records:
+        for reason in r["triage_reasons"]:
+            reasons[reason] = reasons.get(reason, 0) + 1
 
-def calculate_stats(values):
-    values = [value for value in values if value is not None]
+    def quantile(q: float) -> Optional[float]:
+        return None if not ratios else round(ratios[min(len(ratios) - 1, int(q * len(ratios)))], 4)
 
-    if not values:
-        return {
-            "n": 0,
-            "median": None,
-            "mean": None,
-        }
+    measured = [r for r in records if r.get("diff_words") is not None]
 
-    return {
-        "n": len(values),
-        "median": round(statistics.median(values), 4),
-        "mean": round(statistics.mean(values), 4),
-    }
+    def counts_for(few_ratio: float, strict: bool) -> Dict[str, int]:
+        alt = TriageConfig(**{**asdict(cfg), "few_ratio": few_ratio})
+        out = {"accepted": 0, "review_needed": 0, "difficult": 0}
+        for r in measured:
+            d = r["diff_words_strict"] if strict else r["diff_words"]
+            out[agreement_label(d, r["cer_sym"], r["n_words_max"], alt)] += 1
+        return out
 
-
-def summarize(records, human_choice_max_edit_rate):
-    labels = Counter(
-        record.get("triage_label", "unknown")
-        for record in records
-    )
-
-    reasons = Counter()
-
-    for record in records:
-        reasons.update(record.get("triage_reasons", []))
-
-    wer_values = [record.get("wer") for record in records]
-    cer_values = [record.get("cer") for record in records]
-    edit_values = [record.get("word_edit_count") for record in records]
-    rate_values = [record.get("word_edit_rate") for record in records]
-
+    sensitivity = [{"few_ratio": f, "tolerant_spelling": counts_for(f, False), "exact_words": counts_for(f, True)}
+                   for f in (0.10, 0.15, 0.20, 0.30, 0.40)]
     return {
         "triage_version": TRIAGE_VERSION,
-
-        "thresholds": {
-            "cer_acceptance": CER_ACCEPTANCE_THRESHOLD,
-            "human_choice_max_edit_rate": human_choice_max_edit_rate,
-            "relative_rate_denominator": "maximum_word_count_of_either_transcript",
-        },
-
+        "settings": asdict(cfg),
         "segments": len(records),
-
-        "counts": {
-            "accepted": labels["accepted"],
-            "human_choice": labels["human_choice"],
-            "difficult": labels["difficult"],
-        },
-
-        "wer": calculate_stats(wer_values),
-        "cer": calculate_stats(cer_values),
-        "word_edit_count": calculate_stats(edit_values),
-        "word_edit_rate": calculate_stats(rate_values),
-
-        "reasons": dict(reasons),
+        "counts": {k: labels.count(k) for k in ("accepted", "review_needed", "difficult")},
+        "difference_ratio": {"n": len(ratios), "median": quantile(0.5), "p75": quantile(0.75),
+                             "p90": quantile(0.9),
+                             "mean": None if not ratios else round(statistics.mean(ratios), 4)},
+        "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+        "agreement_only_sensitivity": sensitivity,
     }
 
 
-# ---------------------------------------------------------
-# File handling
-# ---------------------------------------------------------
-
-def atomic_write_json(path, data):
-    """Write JSON safely using a temporary file."""
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_path = None
-
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-
-            json.dump(
-                data,
-                temp_file,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-            temp_path = Path(temp_file.name)
-
-        os.replace(temp_path, path)
-
-    finally:
-        if temp_path and temp_path.exists():
-            temp_path.unlink()
+# --------------------------------------------------------------------------- #
+# Files
+# --------------------------------------------------------------------------- #
+def _load_json(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
-# ---------------------------------------------------------
-# Evaluate one video
-# ---------------------------------------------------------
+def _save_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
 
 def evaluate_video(
-    video_id,
-    metadata_dir=METADATA_DIR,
-    human_choice_max_edit_rate=None,
-):
-    if human_choice_max_edit_rate is None:
-        human_choice_max_edit_rate = HUMAN_CHOICE_MAX_EDIT_RATE
-
+    video_id: str,
+    metadata_dir: Path = METADATA_DIR,
+    cfg: Optional[TriageConfig] = None,
+) -> Dict[str, Any]:
+    """Evaluate every clip of one video; update its transcripts file; return the summary."""
+    cfg = cfg or TriageConfig()
     metadata_dir = Path(metadata_dir)
+    path = metadata_dir / f"{video_id}_transcripts.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found - run Stage 7 (transcriber) first.")
+    records = _load_json(path)
 
-    transcripts_path = metadata_dir / f"{video_id}_transcripts.json"
-    summary_path = metadata_dir / f"{video_id}_triage_summary.json"
+    manifest, snr = {}, {}
+    if (metadata_dir / f"{video_id}_segments.json").exists():
+        manifest = {r["segment_id"]: r for r in _load_json(metadata_dir / f"{video_id}_segments.json")}
+    if (metadata_dir / f"{video_id}_snr.json").exists():
+        snr = {r["segment_id"]: r for r in _load_json(metadata_dir / f"{video_id}_snr.json")}
 
-    if not transcripts_path.exists():
-        raise FileNotFoundError(
-            f"Transcript metadata not found: {transcripts_path}"
-        )
+    for rec in records:
+        seg = manifest.get(rec["segment_id"], {})
+        rec.update(triage_clip(
+            rec, cfg,
+            region_label=seg.get("region_label"),
+            boundary_check=seg.get("boundary_check"),
+            snr_wada_db=snr.get(rec["segment_id"], {}).get("snr_wada_db"),
+        ))
+        rec["triage_version"] = TRIAGE_VERSION
 
-    with open(transcripts_path, "r", encoding="utf-8") as file:
-        records = json.load(file)
-
-    if not isinstance(records, list):
-        raise ValueError(
-            f"Expected a list of transcript records in {transcripts_path}"
-        )
-
-    for record in records:
-
-        # Calculate automatic agreement results.
-        evaluation = triage_clip(
-            record,
-            human_choice_max_edit_rate=human_choice_max_edit_rate,
-        )
-
-        record.update(evaluation)
-        record["triage_version"] = TRIAGE_VERSION
-
-        # Preserve a transcript already completed by a human.
-        if record.get("annotation_status") == "completed":
-            record["status"] = "accepted"
-            continue
-
-        if evaluation["triage_label"] == "accepted":
-
-            record["status"] = "accepted"
-            record["annotation_status"] = "not_required"
-
-            # The raw Engine A transcript is used as the
-            # initial final transcript. Normalized text is
-            # only for comparison, not for corpus output.
-            record["final_transcript"] = (
-                record.get("asr_a_text") or ""
-            )
-
-        elif evaluation["triage_label"] == "human_choice":
-
-            record["status"] = "pending_annotation"
-            record["annotation_status"] = "pending"
-
-            # Clear a previous automatically selected
-            # transcript if this segment now needs review.
-            record["final_transcript"] = ""
-
-        else:
-
-            record["status"] = "difficult"
-            record["annotation_status"] = "pending"
-            record["final_transcript"] = ""
-
-    summary = summarize(
-        records,
-        human_choice_max_edit_rate,
-    )
-
+    summary = summarize(records, cfg)
     summary["video_id"] = video_id
-
-    atomic_write_json(transcripts_path, records)
-    atomic_write_json(summary_path, summary)
-
-    print(f"\n[evaluator] {video_id}: {len(records)} clips")
-
-    print("\n  Project outcomes:")
-
-    total = len(records)
-
-    for label in ("accepted", "human_choice", "difficult"):
-        count = summary["counts"][label]
-        percentage = (count / total * 100) if total else 0
-
-        print(
-            f"  {label:<18} {count:>5} "
-            f"({percentage:.1f}%)"
-        )
-
-    print("\n  Agreement metrics:")
-
-    for metric in ("wer", "cer", "word_edit_count", "word_edit_rate"):
-        values = summary[metric]
-
-        if values["n"]:
-            print(
-                f"  {metric:<18} "
-                f"median {values['median']}, "
-                f"mean {values['mean']} "
-                f"({values['n']} clips)"
-            )
-
-    print("\n  Reasons:")
-
-    if summary["reasons"]:
-        for reason, count in summary["reasons"].items():
-            print(f"    {reason}: {count}")
-    else:
-        print("    None")
-
-    print(f"\n  Summary saved: {summary_path}")
-
+    _save_json(path, records)
+    _save_json(metadata_dir / f"{video_id}_triage_summary.json", summary)
     return summary
 
 
-# ---------------------------------------------------------
-# Command-line interface
-# ---------------------------------------------------------
+def print_summary(summary: Dict[str, Any]) -> None:
+    c, d, s = summary["counts"], summary["difference_ratio"], summary["settings"]
+    n = summary["segments"] or 1
+    print(f"\n[evaluator] {summary['video_id']}: {summary['segments']} clips")
+    for label in ("accepted", "review_needed", "difficult"):
+        print(f"  {label:<14} {c[label]:>4}  ({100 * c[label] / n:.0f}%)")
+    print(f"  share of words that differ (A vs B, symmetric): median {d['median']}, p75 {d['p75']}, p90 {d['p90']}"
+          f"  (over {d['n']} clips)")
+    print(f"  settings: a few words = up to {100 * s['few_ratio']:.0f}% of the clip "
+          f"(min {s['min_words']}, max {s['max_words']}), near-spelling tolerance {s['near_ratio']}")
+    if summary["reasons"]:
+        top = ", ".join(f"{k} x{v}" for k, v in list(summary["reasons"].items())[:6])
+        print(f"  top reasons: {top}")
+    print("  agreement alone, under other 'a few words' limits (accepted / review / difficult):")
+    for row in summary["agreement_only_sensitivity"]:
+        t, e = row["tolerant_spelling"], row["exact_words"]
+        print(f"    {100 * row['few_ratio']:.0f}% of the words:  tolerant spelling "
+              f"{t['accepted']} / {t['review_needed']} / {t['difficult']}    exact words "
+              f"{e['accepted']} / {e['review_needed']} / {e['difficult']}")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate agreement between two Arabic ASR engines."
-    )
 
-    parser.add_argument(
-        "--video-id",
-        action="append",
-        help="Video ID to evaluate. Can be supplied more than once.",
-    )
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Stage 9: symmetric engine disagreement and triage.")
+    parser.add_argument("--video-id", action="append", help="Limit to this video id (repeatable).")
+    parser.add_argument("--agree-cer", type=float, default=TriageConfig.agree_cer,
+                        help="CER at or below this counts as agreement (default 0.02).")
+    parser.add_argument("--few-ratio", type=float, default=TriageConfig.few_ratio,
+                        help="'a few words' = up to this share of the clip's words (default 0.15).")
+    parser.add_argument("--min-words", type=int, default=TriageConfig.min_words)
+    parser.add_argument("--max-words", type=int, default=TriageConfig.max_words)
+    parser.add_argument("--near-ratio", type=float, default=TriageConfig.near_ratio,
+                        help="words this close in spelling count as equal; 0 = exact (default 0.2).")
+    parser.add_argument("--min-snr-db", type=float, default=TriageConfig.min_snr_db,
+                        help="WADA SNR below this sends a clip to review (default 10).")
+    args = parser.parse_args(argv)
 
-    parser.add_argument(
-        "--human-choice-rate",
-        type=float,
-        default=HUMAN_CHOICE_MAX_EDIT_RATE,
-        help=(
-            "Maximum relative word edit rate for human_choice. "
-            "Example: 0.10 means 10%%. Default: 0.10."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    if not 0 <= args.human_choice_rate <= 1:
-        parser.error("--human-choice-rate must be between 0 and 1.")
-
+    cfg = TriageConfig(agree_cer=args.agree_cer, few_ratio=args.few_ratio, min_words=args.min_words,
+                       max_words=args.max_words, near_ratio=args.near_ratio, min_snr_db=args.min_snr_db)
     if args.video_id:
         video_ids = args.video_id
     else:
-        video_ids = [
-            path.name.replace("_transcripts.json", "")
-            for path in METADATA_DIR.glob("*_transcripts.json")
-        ]
-
+        video_ids = sorted(p.name[: -len("_transcripts.json")] for p in METADATA_DIR.glob("*_transcripts.json"))
     if not video_ids:
-        print("[evaluator] No transcript files found.")
-        return
-
-    if jiwer is None:
-        print(
-            "[evaluator] Warning: jiwer is not installed. "
-            "Using the built-in edit-distance fallback."
-        )
-
-    print(
-        f"[evaluator] Human-choice threshold: "
-        f"{args.human_choice_rate * 100:.1f}%"
-    )
-
+        print(f"No *_transcripts.json files in {METADATA_DIR}. Run Stage 7 first.")
+        return 1
     for video_id in video_ids:
-        evaluate_video(
-            video_id,
-            human_choice_max_edit_rate=args.human_choice_rate,
-        )
+        print_summary(evaluate_video(video_id, cfg=cfg))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
