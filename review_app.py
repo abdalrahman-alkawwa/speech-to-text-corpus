@@ -346,19 +346,21 @@ with info:
     st.caption(f"Current status: **{status}**")
 
 with texts:
-    st.markdown("**Model A**")
+    language_a = clip.get("asr_a_language") or "unknown"
+    language_b = clip.get("asr_b_language") or "unknown"
+    st.markdown(f"**Model A · {html.escape(language_a)}**")
 
     st.markdown(
-        f"<div class='rtl'>{html.escape(clip.get('asr_a_text') or '—')}</div>",
+        f"<div style='direction:{'rtl' if language_a == 'ar' else 'ltr'};text-align:{'right' if language_a == 'ar' else 'left'};font-size:1.2rem;line-height:1.8;padding:.55rem .7rem;border:1px solid rgba(128,128,128,.35);border-radius:8px;white-space:pre-wrap'>{html.escape(clip.get('asr_a_text') or '—')}</div>",
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        f"**Model B** · {clip.get('asr_b_engine') or 'not run'}"
+        f"**Model B · {clip.get('asr_b_engine') or 'not run'} · {html.escape(language_b)}**"
     )
 
     st.markdown(
-        f"<div class='rtl'>{html.escape(clip.get('asr_b_text') or '—')}</div>",
+        f"<div style='direction:{'rtl' if language_b == 'ar' else 'ltr'};text-align:{'right' if language_b == 'ar' else 'left'};font-size:1.2rem;line-height:1.8;padding:.55rem .7rem;border:1px solid rgba(128,128,128,.35);border-radius:8px;white-space:pre-wrap'>{html.escape(clip.get('asr_b_text') or '—')}</div>",
         unsafe_allow_html=True,
     )
 

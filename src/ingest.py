@@ -37,6 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # json: Standard library for reading and writing structured JSON metadata files
 import json
+import os
 import re
 
 # datetime, timezone: For generating standard ISO 8601 UTC timestamps of when downloads occurred
@@ -61,6 +62,19 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 # metadata/: Stores reproducible JSON provenance records for every recording
 METADATA_DIR = PROJECT_ROOT / "metadata"
+
+# The same browser session used by the local yt-dlp diagnostic. Set this to an
+# empty string to disable browser cookies, or to another supported browser name.
+YTDLP_COOKIES_FROM_BROWSER = os.environ.get(
+    "YTDLP_COOKIES_FROM_BROWSER", "brave"
+).strip()
+
+
+def _browser_cookie_options() -> Dict[str, Any]:
+    """Return yt-dlp browser-cookie options when a browser is configured."""
+    if not YTDLP_COOKIES_FROM_BROWSER:
+        return {}
+    return {"cookiesfrombrowser": (YTDLP_COOKIES_FROM_BROWSER,)}
 
 
 def get_ytdlp_version() -> str:
@@ -88,7 +102,7 @@ def fetch_video_metadata(url: str) -> Dict[str, Any]:
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
-      
+        **_browser_cookie_options(),
     }
 
     # Initialize yt-dlp with our options
@@ -172,6 +186,7 @@ def download_audio(url: str, stem: str, id: str) -> Path:
             "fragment_retries": 20,
             "extractor_retries": 5,
             "file_access_retries": 5,
+            **_browser_cookie_options(),
         }
 
         with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:

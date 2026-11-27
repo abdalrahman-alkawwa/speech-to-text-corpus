@@ -11,7 +11,7 @@ matplotlib
 tqdm
 
 # Video/audio acquisition
-yt-dlp
+yt-dlp[default]
 
 # Speech recognition
 faster-whisper

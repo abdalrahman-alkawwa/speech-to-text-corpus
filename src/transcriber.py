@@ -82,7 +82,7 @@ SAVE_EVERY_N = 10
 WHISPER_MODEL = "large-v3-turbo"
 WHISPER_ENGINE_TAG = "faster-whisper-large-v3-turbo"
 
-WHISPER_LANGUAGE = "ar"
+WHISPER_LANGUAGE = "auto"
 WHISPER_BEAM_SIZE = 5
 
 
@@ -94,6 +94,7 @@ COHERE_MODEL = "CohereLabs/cohere-transcribe-arabic-07-2026"
 COHERE_ENGINE_TAG = "cohere-transcribe-arabic-07-2026-local"
 
 COHERE_LANGUAGE = "ar"
+SUPPORTED_COHERE_LANGUAGES = {"ar", "en"}
 # The Cohere model card's offline quick start uses 256. 512 allowed pathological
 # repetition loops to consume the entire generation budget on short clips.
 COHERE_MAX_NEW_TOKENS = 256
@@ -280,6 +281,7 @@ def load_whisper():
 def transcribe_whisper(
     model,
     wav_path: Path,
+    language: str = "auto",
 ) -> Dict[str, Any]:
     """
     Transcribe one WAV file using faster-whisper.
@@ -290,7 +292,7 @@ def transcribe_whisper(
 
     segments, info = model.transcribe(
         str(wav_path),
-        language=WHISPER_LANGUAGE,
+        language=None if language == "auto" else language,
         beam_size=WHISPER_BEAM_SIZE,
         vad_filter=False,
         condition_on_previous_text=False,
@@ -337,6 +339,7 @@ def transcribe_whisper(
         "asr_a_engine": WHISPER_ENGINE_TAG,
         "asr_a_text": transcript,
         "asr_a_language": getattr(info, "language", None),
+        "asr_a_language_mode": language,
         "asr_a_language_probability": getattr(
             info, "language_probability", None
         ),
@@ -427,6 +430,8 @@ def transcribe_cohere(
     processor,
     model,
     wav_path: Path,
+    language: str = COHERE_LANGUAGE,
+    language_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Transcribe one WAV file using local Cohere Transcribe Arabic.
@@ -462,7 +467,7 @@ def transcribe_cohere(
         audio,
         sampling_rate=EXPECTED_SAMPLE_RATE,
         return_tensors="pt",
-        language=COHERE_LANGUAGE,
+        language=language,
     )
 
     # Move input tensors to the same device as the model.
@@ -506,7 +511,9 @@ def transcribe_cohere(
         "asr_b_engine": COHERE_ENGINE_TAG,
         "asr_b_text": transcript,
         "asr_b_confidence": None,
-        "asr_b_language": COHERE_LANGUAGE,
+        "asr_b_language": language,
+        "asr_b_language_mode": language_mode or language,
+        "asr_b_status": "transcribed",
         "asr_b_generated_tokens": generated_tokens,
         "asr_b_hit_token_limit": hit_token_limit,
         "asr_b_quality_flags": quality_flags,
@@ -587,6 +594,7 @@ def transcribe_video(
     model=None,
     limit: Optional[int] = None,
     force: bool = False,
+    language: str = WHISPER_LANGUAGE,
 ) -> None:
     """
     Run Engine A on every segment belonging to a video.
@@ -623,7 +631,7 @@ def transcribe_video(
 
             print(f"\n[Engine A] {segment_id}")
 
-            result = transcribe_whisper(model, wav_path)
+            result = transcribe_whisper(model, wav_path, language=language)
 
             record.update(result)
 
@@ -658,6 +666,7 @@ def transcribe_video_b(
     model=None,
     limit: Optional[int] = None,
     force: bool = False,
+    language: str = WHISPER_LANGUAGE,
 ) -> None:
     """
     Run local Cohere Transcribe Arabic on every segment.
@@ -672,9 +681,7 @@ def transcribe_video_b(
     records = load_records(path)
 
     own_model = processor is None or model is None
-
-    if own_model:
-        processor, model = load_cohere()
+    loaded_model = False
 
     processed = 0
     skipped = 0
@@ -696,11 +703,38 @@ def transcribe_video_b(
 
             print(f"\n[Engine B] {segment_id}")
 
-            result = transcribe_cohere(
-                processor,
-                model,
-                wav_path,
+            detected_language = str(record.get("asr_a_language") or "").lower().split("-")[0]
+            target_language = (
+                language if language in SUPPORTED_COHERE_LANGUAGES
+                else detected_language
             )
+            if target_language not in SUPPORTED_COHERE_LANGUAGES:
+                result = {
+                    "asr_b_engine": COHERE_ENGINE_TAG,
+                    "asr_b_text": "",
+                    "asr_b_confidence": None,
+                    "asr_b_language": None,
+                    "asr_b_language_mode": language,
+                    "asr_b_status": "unsupported_language",
+                    "asr_b_generated_tokens": 0,
+                    "asr_b_hit_token_limit": False,
+                    "asr_b_quality_flags": ["unsupported_language"],
+                }
+                print(
+                    "Cohere skipped: Whisper detected an unsupported language "
+                    f"({detected_language or 'unknown'})."
+                )
+            else:
+                if own_model and not loaded_model:
+                    processor, model = load_cohere()
+                    loaded_model = True
+                result = transcribe_cohere(
+                    processor,
+                    model,
+                    wav_path,
+                    language=target_language,
+                    language_mode=language,
+                )
 
             record.update(result)
 
@@ -715,7 +749,7 @@ def transcribe_video_b(
         save_records(path, records)
 
     finally:
-        if own_model:
+        if loaded_model:
             del model
             del processor
             unload_model()
@@ -735,6 +769,7 @@ def run_engines(
     engines: str = "a",
     limit: Optional[int] = None,
     force: bool = False,
+    language: str = WHISPER_LANGUAGE,
 ) -> None:
     """
     Run Engine A, Engine B, or both.
@@ -745,6 +780,8 @@ def run_engines(
 
     if engines not in ("a", "b", "both"):
         raise ValueError("engines must be 'a', 'b', or 'both'")
+    if language not in ("auto", "ar", "en"):
+        raise ValueError("language must be 'auto', 'ar', or 'en'")
 
     for video_id in video_ids:
 
@@ -760,6 +797,7 @@ def run_engines(
                 video_id,
                 limit=limit,
                 force=force,
+                language=language,
             )
 
             unload_model()
@@ -772,6 +810,7 @@ def run_engines(
                 video_id,
                 limit=limit,
                 force=force,
+                language=language,
             )
 
             unload_model()
@@ -834,6 +873,13 @@ def main() -> None:
         help="Re-transcribe segments that already have transcripts.",
     )
 
+    parser.add_argument(
+        "--language",
+        choices=["auto", "ar", "en"],
+        default="auto",
+        help="Auto-detect Arabic/English, or force Arabic or English.",
+    )
+
     args = parser.parse_args()
 
     if args.video_id:
@@ -861,6 +907,7 @@ def main() -> None:
         engines=args.engine,
         limit=args.limit,
         force=args.force,
+        language=args.language,
     )
 
     elapsed = time.time() - start_time

@@ -26,8 +26,8 @@ How "different words" is counted
 * CER is symmetric too (character edits / the longer text).
 
 A clip is NOT accepted, even when the engines agree, if a warning sign is present (agreement
-is not proof).  Warning signs: region "mixed"/"music", a flagged cut, engine B text missing,
-Latin letters / digits left in engine A's text, Whisper compression_ratio > 2.4 or
+is not proof). Warning signs: region "mixed"/"music", a flagged cut, engine B text missing,
+language mismatch, unknown-language Latin/digits in engine A's text, Whisper compression_ratio > 2.4 or
 avg_logprob < -1.0, WADA SNR below min_snr_db.  Engine A text empty or Whisper
 no_speech_prob > 0.6 makes a clip "difficult".
 
@@ -66,7 +66,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.normalizer import normalize_with_flags
 
 METADATA_DIR = PROJECT_ROOT / "metadata"
-TRIAGE_VERSION = "triage_v3_waw_spacing"
+TRIAGE_VERSION = "triage_v4_language_aware"
+AUTO_LANGUAGE_REVIEW_THRESHOLD = 0.70
 MIN_NEAR_LENGTH = 5                      # words shorter than this must match exactly
 
 try:                                    # optional dependency
@@ -205,13 +206,21 @@ def triage_clip(
     boundary_check: Optional[str] = None,
     snr_wada_db: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Score one clip: the disagreement metrics, a triage label and the reasons for it."""
+    """Score one clip, comparing normalized texts only when languages match."""
     # Always normalize from the RAW text.  Stored *_text_norm fields can be stale (for example
     # after engine B was re-run), and normalizing is instant and deterministic anyway.
     raw_a = rec.get("asr_a_text")
     raw_b = rec.get("asr_b_text")
-    text_a, flags_a = normalize_with_flags(raw_a if raw_a is not None else rec.get("asr_a_text_norm"))
-    text_b, _ = normalize_with_flags(raw_b if raw_b is not None else rec.get("asr_b_text_norm"))
+    language_a = rec.get("asr_a_language")
+    language_b = rec.get("asr_b_language")
+    text_a, flags_a = normalize_with_flags(
+        raw_a if raw_a is not None else rec.get("asr_a_text_norm"),
+        language=language_a,
+    )
+    text_b, flags_b = normalize_with_flags(
+        raw_b if raw_b is not None else rec.get("asr_b_text_norm"),
+        language=language_b,
+    )
     text_a = canonicalize_arabic_waw_spacing(text_a)
     text_b = canonicalize_arabic_waw_spacing(text_b)
 
@@ -234,23 +243,45 @@ def triage_clip(
     logprob = rec.get("asr_a_avg_logprob")
     if logprob is not None and logprob < cfg.min_avg_logprob:
         review.append("avg_logprob_low")
+    language_probability = rec.get("asr_a_language_probability")
+    if (
+        rec.get("asr_a_language_mode") == "auto"
+        and language_probability is not None
+        and language_probability < AUTO_LANGUAGE_REVIEW_THRESHOLD
+    ):
+        review.append("language_detection_uncertain")
 
     # --- agreement between the engines ---
     if text_b is None:
         review.append("engine_b_missing")
+    elif not text_b:
+        if rec.get("asr_b_status") == "unsupported_language":
+            review.append("engine_b_unsupported_language")
+        else:
+            review.append("engine_b_empty")
     elif text_a:
-        metrics = compare_texts(text_a, text_b, cfg.near_ratio)
-        allowed = allowed_words(metrics["n_words_max"], cfg)
-        wer, cer = compute_wer_cer(text_a, text_b)
-        result.update({**metrics, "allowed_diff_words": allowed,
-                       "diff_ratio": round(metrics["diff_ratio"], 4), "cer_sym": round(metrics["cer_sym"], 4),
-                       "wer": None if wer is None else round(wer, 4),
-                       "cer": None if cer is None else round(cer, 4)})
-        verdict = agreement_label(metrics["diff_words"], metrics["cer_sym"], metrics["n_words_max"], cfg)
-        if verdict == "difficult":
-            difficult.append("many_words_differ")
-        elif verdict == "review_needed":
-            review.append("few_words_differ")
+        normalized_language_a = str(language_a or "").lower().split("-")[0]
+        normalized_language_b = str(language_b or "").lower().split("-")[0]
+        if bool(normalized_language_a) != bool(normalized_language_b):
+            review.append("language_unknown")
+        elif (normalized_language_a and normalized_language_b
+              and normalized_language_a != normalized_language_b):
+            # WER/CER across different language outputs are not useful measures
+            # of recognition disagreement; leave the clip for human review.
+            review.append("language_mismatch")
+        else:
+            metrics = compare_texts(text_a, text_b, cfg.near_ratio)
+            allowed = allowed_words(metrics["n_words_max"], cfg)
+            wer, cer = compute_wer_cer(text_a, text_b)
+            result.update({**metrics, "allowed_diff_words": allowed,
+                           "diff_ratio": round(metrics["diff_ratio"], 4), "cer_sym": round(metrics["cer_sym"], 4),
+                           "wer": None if wer is None else round(wer, 4),
+                           "cer": None if cer is None else round(cer, 4)})
+            verdict = agreement_label(metrics["diff_words"], metrics["cer_sym"], metrics["n_words_max"], cfg)
+            if verdict == "difficult":
+                difficult.append("many_words_differ")
+            elif verdict == "review_needed":
+                review.append("few_words_differ")
 
     # --- context: where the clip came from ---
     if region_label in ("mixed", "music"):
@@ -261,8 +292,11 @@ def triage_clip(
         review.append("low_snr")
     # Flags describe engine A's text, the one reviewers start from.  Engine B may use another
     # convention (for example English words in Latin letters); that already shows up in the difference.
-    for flag in sorted(set(flags_a)):
+    known_language = bool(language_a or language_b)
+    for flag in sorted(set(flags_a + flags_b)):
         if flag != "empty":
+            if known_language and flag in ("latin_text", "digits_left"):
+                continue
             review.append(f"norm_{flag}")
 
     label = "difficult" if difficult else ("review_needed" if review else "accepted")

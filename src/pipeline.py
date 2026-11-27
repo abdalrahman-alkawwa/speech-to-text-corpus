@@ -292,6 +292,7 @@ def run_pipeline(
     run_transcription: bool = False,
     transcription_limit: int = None,
     progress_callback=None,
+    transcription_language: str = "auto",
 ) -> dict:
     """
     Execute the complete Arabic speech corpus pipeline.
@@ -316,6 +317,10 @@ def run_pipeline(
     transcription_limit:
         Optional maximum number of newly exported segments to send through
         both ASR engines. Segmentation still exports the full requested set.
+
+    transcription_language:
+        ``auto`` uses Whisper's language detection and routes Cohere to Arabic
+        or English per segment. ``ar`` and ``en`` force that language.
 
     progress_callback:
         Optional callable receiving a short message before each pipeline stage.
@@ -588,6 +593,7 @@ def run_pipeline(
                 engines="both",
                 limit=transcription_limit,
                 force=False,
+                language=transcription_language,
             )
 
             # Confirm the transcript file still exists.

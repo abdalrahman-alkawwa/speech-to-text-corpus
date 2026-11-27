@@ -1,7 +1,7 @@
 """
 src/normalizer.py
 =================
-Stage 8: Deterministic Arabic text normalization.
+Stage 8: Deterministic Arabic/English transcript normalization.
 
 Why this stage exists
 ---------------------
@@ -13,10 +13,10 @@ disagree for reasons that have nothing to do with hearing the audio differently:
     Whisper:  "فبقى"               MMS:  "فبقي"               (ى vs ي)
     Whisper:  "مرحبا، كيف حالك؟"   MMS:  "مرحبا كيف حالك"     (punctuation)
 
-Normalization maps both texts to one canonical spelling, so the remaining
-differences are real ones.  It is purely rule-based (no model, no randomness), it is
-idempotent (normalizing twice changes nothing), and it NEVER overwrites the raw text:
-results go into separate *_text_norm fields.
+Normalization maps each transcript to a canonical spelling for its recorded
+language, so the remaining differences are real ones. It is purely rule-based
+(no model, no randomness), idempotent, and NEVER overwrites raw text: results go
+into separate *_text_norm fields.
 
 The rules (norm_v1)
 -------------------
@@ -26,11 +26,13 @@ The rules (norm_v1)
  4. Letters:  أ إ آ ٱ -> ا     ى -> ي     ة -> ه     ؤ -> و     ئ -> ي
               Persian ک ی ھ -> ك ي ه
  5. "%" -> "في المائة".
- 6. Whole numbers -> Arabic words (0 .. 999,999,999), e.g. 70 -> سبعين.
+ 6. Arabic-only whole numbers -> Arabic words (0 .. 999,999,999), e.g. 70 -> سبعين.
     A number glued to Arabic letters is glued to its words:  بال70 -> بالسبعين.
     Numbers starting with 0 (phone numbers) and numbers of 10+ digits are read digit by digit.
     Decimals: 3.5 -> ثلاثة فاصل خمسة (fraction read digit by digit) and flagged "decimal_number".
- 7. Punctuation and symbols -> space; Latin letters -> lowercase; whitespace collapsed.
+ 7. English numbers remain numeric, percent becomes "percent", and Latin text is lowercased.
+    Arabic-English mixed text keeps numbers numeric if it contains Latin words.
+ 8. Punctuation and symbols -> space; whitespace collapsed.
 
 What it does NOT do (flagged instead)
 -------------------------------------
@@ -60,7 +62,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 METADATA_DIR = PROJECT_ROOT / "metadata"
 
-NORM_VERSION = "norm_v1"
+NORM_VERSION = "norm_v2_language_aware"
 TEXT_FIELDS = ("asr_a_text", "asr_b_text")          # each gets a "<name>_norm" companion
 
 # --------------------------------------------------------------------------- #
@@ -210,18 +212,33 @@ def _flags(text: Optional[str]) -> List[str]:
     return found
 
 
-def _normalize(text: Optional[str]) -> Tuple[Optional[str], List[str]]:
+def _normalize(
+    text: Optional[str], language: Optional[str] = None
+) -> Tuple[Optional[str], List[str]]:
     if text is None:
         return None, []
+    language = (language or "").lower().split("-")[0]
     s = unicodedata.normalize("NFKC", text)
     s = _INVISIBLE.sub("", s).replace(_TATWEEL, "")
     s = _DIACRITICS.sub("", s)
     s = s.translate(_DIGIT_MAP)
     s = _map_chars(s).lower()
-    s = s.replace("%", " في المائة ").replace("\u066A", " في المائة ")
+    has_latin = bool(re.search(r"[a-z]", s))
+    arabic_rules = language == "ar" or (not language and not has_latin)
+    if not arabic_rules:
+        # Keep English numbers in their written form (e.g. 5G, 2026) and
+        # avoid replacing percent signs with Arabic words.
+        s = s.replace("%", " percent ").replace("\u066A", " percent ")
+    else:
+        s = s.replace("%", " في المائة ").replace("\u066A", " في المائة ")
     s = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", s)              # 1,000 -> 1000
-    s, had_decimal = _expand_decimals(s)
-    s = _expand_numbers(s)
+    if language == "en" or has_latin:
+        s = re.sub(r"(?<=\d)[.,](?=\d)", " decimal ", s)
+    if arabic_rules and not has_latin:
+        s, had_decimal = _expand_decimals(s)
+        s = _expand_numbers(s)
+    else:
+        had_decimal = False
     s = _map_chars(s)                                          # the number words need the same spelling rules
     s = re.sub(r"[^\w\s]|_", " ", s)                           # punctuation / symbols -> space
     s = re.sub(r"\s+", " ", s).strip()
@@ -234,9 +251,11 @@ def normalize_arabic(text: Optional[str]) -> Optional[str]:
     return _normalize(text)[0]
 
 
-def normalize_with_flags(text: Optional[str]) -> Tuple[Optional[str], List[str]]:
+def normalize_with_flags(
+    text: Optional[str], language: Optional[str] = None
+) -> Tuple[Optional[str], List[str]]:
     """(normalized text, flags) - flags: digits_left, latin_text, decimal_number, empty."""
-    return _normalize(text)
+    return _normalize(text, language=language)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,7 +272,8 @@ def normalize_records(records: List[Dict[str, Any]]) -> Dict[str, int]:
         flags: List[str] = []
         for field in TEXT_FIELDS:
             raw = rec.get(field)
-            norm, field_flags = _normalize(raw)
+            language = rec.get(field.replace("_text", "_language"))
+            norm, field_flags = _normalize(raw, language=language)
             rec[f"{field}_norm"] = norm
             rec[f"{field}_norm_flags"] = field_flags
             if raw is not None and norm != raw:

@@ -1,6 +1,7 @@
 """Arabic Speech Corpus Studio: pipeline, segment review, and CSV export."""
 
 import io
+import html
 import json
 import sys
 import csv
@@ -159,6 +160,20 @@ def _render_pipeline():
             "Source / permissions notes",
             placeholder="Document permission, license, dialect, or context",
         )
+        language_choice = st.selectbox(
+            "Speech language",
+            ["Auto-detect Arabic/English", "Arabic (including Arabic-English mix)", "English"],
+            help=(
+                "Auto mode detects each segment with Whisper, then selects "
+                "Arabic or English for Cohere. Mixed Arabic-English speech "
+                "can use the Arabic option."
+            ),
+        )
+        transcription_language = {
+            "Auto-detect Arabic/English": "auto",
+            "Arabic (including Arabic-English mix)": "ar",
+            "English": "en",
+        }[language_choice]
         choice = st.radio(
             "Transcription scope",
             ["Transcribe every segment", "Transcribe the first N segments"],
@@ -190,23 +205,32 @@ def _render_pipeline():
                     run_snr=True,
                     run_transcription=True,
                     transcription_limit=int(limit) if limit is not None else None,
+                    transcription_language=transcription_language,
                     progress_callback=status.write,
                 )
                 video_id = result["metadata"]["video_id"]
-                csv_path = rs.ensure_csv(video_id, META)
-                st.session_state["active_video"] = video_id
                 status.update(label="Pipeline complete", state="complete")
-                st.success(
-                    f"Processed **{result['metadata']['title']}**. "
-                    f"Created {len(result['segments'])} segments."
-                )
-                st.info(f"Review CSV ready: `{csv_path.name}`")
+                if result["segments"]:
+                    csv_path = rs.ensure_csv(video_id, META)
+                    st.session_state["active_video"] = video_id
+                    st.success(
+                        f"Processed **{result['metadata']['title']}**. "
+                        f"Created {len(result['segments'])} segments."
+                    )
+                    st.info(f"Review CSV ready: `{csv_path.name}`")
+                else:
+                    st.warning(
+                        f"Processed **{result['metadata']['title']}**, but no speech "
+                        "segments were exported. Transcription and the review CSV "
+                        "were skipped. Check the classified regions and speech "
+                        "detection settings, then rerun the pipeline."
+                    )
                 st.dataframe(
                     pd.DataFrame(
                         [
                             {"Stage": "Classified regions", "Result": len(result["regions"])},
                             {"Stage": "Exported segments", "Result": len(result["segments"])},
-                            {"Stage": "Transcribed per engine", "Result": min(len(result["segments"]), int(limit)) if limit is not None else len(result["segments"])},
+                            {"Stage": "Segments selected for ASR", "Result": min(len(result["segments"]), int(limit)) if limit is not None else len(result["segments"])},
                         ]
                     ),
                     hide_index=True,
@@ -489,10 +513,88 @@ def _render_review():
         if clip.get("triage_reasons"):
             st.caption("Review flags: " + ", ".join(clip["triage_reasons"]))
     with transcripts:
-        st.markdown("**Model A · faster-whisper**")
-        st.markdown(f"<div class='rtl'>{rs.clean_text(clip.get('asr_a_text')) or '—'}</div>", unsafe_allow_html=True)
-        st.markdown(f"**Model B · {clip.get('asr_b_engine') or 'Cohere'}**")
-        st.markdown(f"<div class='rtl'>{rs.clean_text(clip.get('asr_b_text')) or '—'}</div>", unsafe_allow_html=True)
+        language_a = clip.get("asr_a_language") or "unknown"
+        language_b = clip.get("asr_b_language") or "unknown"
+        direction_a = "rtl" if language_a == "ar" else "ltr"
+        direction_b = "rtl" if language_b == "ar" else "ltr"
+        alignment_a = "right" if language_a == "ar" else "left"
+        alignment_b = "right" if language_b == "ar" else "left"
+        st.markdown(f"**Model A · faster-whisper · {html.escape(language_a)}**")
+        st.markdown(
+            f"<div style='direction:{direction_a};text-align:{alignment_a};font-size:1.2rem;line-height:1.8;padding:.55rem .7rem;border:1px solid rgba(128,128,128,.35);border-radius:8px;white-space:pre-wrap'>{html.escape(rs.clean_text(clip.get('asr_a_text')) or '—')}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"**Model B · {html.escape(clip.get('asr_b_engine') or 'Cohere')} · {html.escape(language_b)}**")
+        st.markdown(
+            f"<div style='direction:{direction_b};text-align:{alignment_b};font-size:1.2rem;line-height:1.8;padding:.55rem .7rem;border:1px solid rgba(128,128,128,.35);border-radius:8px;white-space:pre-wrap'>{html.escape(rs.clean_text(clip.get('asr_b_text')) or '—')}</div>",
+            unsafe_allow_html=True,
+        )
+        asr_audio = Path(clip["audio_abspath"]) if clip.get("audio_abspath") else None
+        if st.button(
+            "Transcribe this segment with both models",
+            key=f"transcribe_review_{sid}",
+            disabled=not reviewer or not (asr_audio and asr_audio.is_file()),
+            help="Runs faster-whisper, then Cohere, and saves each result to the review CSV.",
+        ):
+            from src import transcriber
+
+            saved_a = False
+            try:
+                with st.spinner("Running Model A (faster-whisper)…"):
+                    model_a = transcriber.load_whisper()
+                    try:
+                        result_a = transcriber.transcribe_whisper(
+                            model_a, asr_audio, language="auto"
+                        )
+                    finally:
+                        del model_a
+                        transcriber.unload_model()
+                    rs.save_asr_results(
+                        video_id, sid, result_a, reviewer, metadata_dir=META
+                    )
+                    saved_a = True
+                    if not st.session_state.get(text_key):
+                        st.session_state[text_key] = result_a.get("asr_a_text", "")
+
+                detected_language = str(
+                    result_a.get("asr_a_language") or ""
+                ).lower().split("-")[0]
+                if detected_language not in transcriber.SUPPORTED_COHERE_LANGUAGES:
+                    st.session_state["review_notice"] = (
+                        f"Model A transcript saved. Model B was skipped because "
+                        f"Whisper detected unsupported language "
+                        f"'{detected_language or 'unknown'}'."
+                    )
+                    st.rerun()
+
+                with st.spinner("Running Model B (Cohere)…"):
+                    processor_b, model_b = transcriber.load_cohere()
+                    try:
+                        result_b = transcriber.transcribe_cohere(
+                            processor_b,
+                            model_b,
+                            asr_audio,
+                            language=detected_language,
+                            language_mode="auto",
+                        )
+                    finally:
+                        del model_b, processor_b
+                        transcriber.unload_model()
+                    rs.save_asr_results(
+                        video_id, sid, result_b, reviewer, metadata_dir=META
+                    )
+
+                st.session_state["review_notice"] = (
+                    f"Both model transcripts saved for {sid}."
+                )
+                st.rerun()
+            except Exception as exc:
+                if saved_a:
+                    st.session_state["review_notice"] = (
+                        f"Model A transcript saved for {sid}; Model B failed: {exc}"
+                    )
+                    st.rerun()
+                st.error(f"Could not transcribe {sid}: {exc}")
 
     picks = st.columns(2)
     if picks[0].button("Use Model A", key=f"use_a_{sid}", use_container_width=True):

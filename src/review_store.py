@@ -30,7 +30,9 @@ CSV_COLUMNS = [
     "snr",
     "quality",
     "model_A_transcript",
+    "model_A_language",
     "model_B_transcript",
+    "model_B_language",
     "final_transcript",
     "status",
     "review_status",
@@ -205,7 +207,9 @@ def ensure_csv(
             "snr": snr_value,
             "quality": initial_quality,
             "model_A_transcript": record.get("asr_a_text", ""),
+            "model_A_language": record.get("asr_a_language", ""),
             "model_B_transcript": record.get("asr_b_text", ""),
+            "model_B_language": record.get("asr_b_language", ""),
             "final_transcript": (
                 record.get("asr_b_text", "")
                 if _corpus_status(record.get("triage_label")) == "accepted"
@@ -337,6 +341,13 @@ def load_clips(
 
         # CSV is authoritative for review fields.
         clip.update(row)
+
+        # Manual and structurally edited segments can receive fresh ASR
+        # results directly in the review CSV, without a transcript JSON row.
+        clip["asr_a_text"] = row.get("model_A_transcript") or clip.get("asr_a_text", "")
+        clip["asr_a_language"] = row.get("model_A_language") or clip.get("asr_a_language")
+        clip["asr_b_text"] = row.get("model_B_transcript") or clip.get("asr_b_text", "")
+        clip["asr_b_language"] = row.get("model_B_language") or clip.get("asr_b_language")
 
         clip["video_id"] = video_id
         clip["start_sec"] = _as_float(row.get("start"))
@@ -527,6 +538,65 @@ def update_review(
         raise KeyError(f"Segment {segment_id} was not found in {path.name}")
 
     _write_csv(path, rows)
+
+
+def save_asr_results(
+    video_id: str,
+    segment_id: str,
+    results: Dict[str, Any],
+    reviewer: str,
+    metadata_dir: Path = METADATA_DIR,
+) -> None:
+    """Save model transcripts for a segment without changing its review decision."""
+    reviewer = clean_text(reviewer)
+    if not reviewer:
+        raise ValueError("Enter your name before saving ASR results.")
+
+    field_map = {
+        "asr_a_text": "model_A_transcript",
+        "asr_a_language": "model_A_language",
+        "asr_b_text": "model_B_transcript",
+        "asr_b_language": "model_B_language",
+    }
+    updates = {
+        target: clean_text(results[source]) or ""
+        for source, target in field_map.items()
+        if source in results
+    }
+    if not updates:
+        raise ValueError("No model transcript fields were provided.")
+
+    path = csv_path(video_id, metadata_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"Review CSV not found: {path}")
+
+    rows = _read_csv(path)
+    for row in rows:
+        if row.get("segment_id") != segment_id:
+            continue
+
+        before = {field: row.get(field, "") for field in updates}
+        row.update(updates)
+        after = {field: row.get(field, "") for field in updates}
+        stamp = datetime.now(timezone.utc).isoformat()
+        try:
+            history = json.loads(row.get("change_log") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            history = []
+        history.append({
+            "changed_at": stamp,
+            "changed_by": reviewer,
+            "operation": "asr_refresh",
+            "before": before,
+            "after": after,
+        })
+        row["changed_by"] = reviewer
+        row["changed_at"] = stamp
+        row["change_log"] = json.dumps(history, ensure_ascii=False)
+        _write_csv(path, rows)
+        return
+
+    raise KeyError(f"Segment {segment_id} was not found in {path.name}")
 
 
 def _manual_id(video_id: str, rows: Sequence[Dict[str, str]]) -> str:

@@ -25,8 +25,26 @@ Install the following before starting:
 |---|---|
 | Python 3.13 | Main programming language |
 | FFmpeg 9.0.2 | Audio conversion and processing |
+| Deno 2.9+ | JavaScript challenge runtime used by yt-dlp for YouTube |
 | VS Code | Development environment |
 | Git | Version control (recommended) |
+
+### Install Deno on Windows
+
+In PowerShell, install Deno using its official installer, then open a new
+terminal and verify it is available:
+
+```powershell
+irm https://deno.land/install.ps1 | iex
+deno --version
+```
+
+The Python requirements install yt-dlp's EJS challenge solver scripts. Deno is
+a separate runtime and must be available on `PATH` for YouTube extraction.
+The ingestion pipeline reads cookies from Brave by default; close Brave before
+starting ingestion so yt-dlp can copy its cookie database. Set
+`YTDLP_COOKIES_FROM_BROWSER` to another supported browser name, or to an empty
+string to disable browser cookies.
 
 ### Verify installations
 
